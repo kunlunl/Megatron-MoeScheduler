@@ -97,7 +97,13 @@ class _ReplicaWaitGradReduce(torch.autograd.Function):
 
             if get_dummy_wgrad is None:
                 raise RuntimeError("Replica fused wgrad accumulation requires Transformer Engine.")
-            main_grad.add_(source_grad)
+            # FSDP's unsharded communication bucket is not zero-initialized:
+            # each microbatch overwrites it before reduce-scatter accumulates
+            # into the persistent shard. DDP instead accumulates locally.
+            if getattr(parameter, "overwrite_main_grad", False):
+                main_grad.copy_(source_grad)
+            else:
+                main_grad.add_(source_grad)
             parameter.grad_added_to_main_grad = True
             autograd_grads.append(
                 get_dummy_wgrad(

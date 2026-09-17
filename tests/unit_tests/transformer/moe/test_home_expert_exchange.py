@@ -45,6 +45,30 @@ def _transport(group):
     )
 
 
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_replica_gradient_handoff_respects_fsdp_overwrite(distributed_world, overwrite):
+    from megatron.core.transformer.moe.replica_expert_dispatch import _ReplicaWaitGradReduce
+
+    parameter = torch.nn.Parameter(torch.zeros(2, 3, device="cuda", dtype=torch.bfloat16))
+    parameter.main_grad = torch.full(
+        (2, 3), float("nan") if overwrite else 7.0, device="cuda", dtype=torch.float32
+    )
+    parameter.grad_added_to_main_grad = False
+    parameter.overwrite_main_grad = overwrite
+    source = torch.arange(6, device="cuda", dtype=torch.float32).reshape(2, 3)
+    context = SimpleNamespace(
+        runtime=SimpleNamespace(
+            source_parameters=(parameter,), wait_grad_reduce=lambda plan: (source,)
+        ),
+        context=SimpleNamespace(plan=None),
+        num_source_parameters=1,
+    )
+    _ReplicaWaitGradReduce.backward(context, torch.ones(1, device="cuda"))
+    expected = source if overwrite else source + 7
+    torch.testing.assert_close(parameter.main_grad, expected, rtol=0, atol=0)
+    assert parameter.grad_added_to_main_grad
+
+
 def test_deferred_home_cycles_preserve_adam_continuation(ep_group):
     transport = _transport(ep_group)
     rank, size = dist.get_rank(ep_group), dist.get_world_size(ep_group)

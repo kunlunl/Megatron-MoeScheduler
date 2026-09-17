@@ -435,7 +435,14 @@ class _ReplicaProjection:
         """Create the stable native-then-virtual TE parameter sequence once."""
         runtime_parameters = []
         for weight, grad in zip(weights, grads):
-            parameter = torch.nn.Parameter(weight, requires_grad=True)
+            # These are runtime views, not optimizer-owned parameters. Replica
+            # storage is restored to this microbatch's plan before backward,
+            # potentially after other forwards reused it. Give BF16 wrappers
+            # independent version counters, as native parameter.data views and
+            # raw Peer-TMA writes already do. The dispatcher owns restoration
+            # and stream ordering; TE still checks mutations of its own wrapper.
+            runtime_weight = weight.data if self.weight_format == "bf16" else weight
+            parameter = torch.nn.Parameter(runtime_weight, requires_grad=True)
             parameter.main_grad = grad
             parameter.grad_added_to_main_grad = True
             # TE's wgrad GEMM then rewrites the staging and every replica slot

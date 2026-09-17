@@ -121,8 +121,12 @@ def expert_tp_group(distributed_world):
     dist.destroy_process_group(group)
 
 
-@pytest.mark.parametrize("swizzled", [False, True])
-def test_nccl_mxfp8_runtime_te_forward_and_dgrad(ep_group, expert_tp_group, swizzled, monkeypatch):
+@pytest.mark.parametrize(
+    "weight_format,swizzled", [("bf16", False), ("mxfp8", False), ("mxfp8", True)]
+)
+def test_nccl_runtime_forward_and_dgrad(
+    ep_group, expert_tp_group, weight_format, swizzled, monkeypatch
+):
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.cpp_extensions import general_gemm
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
@@ -176,7 +180,12 @@ def test_nccl_mxfp8_runtime_te_forward_and_dgrad(ep_group, expert_tp_group, swiz
     for linear, shape in zip((experts.linear_fc1, experts.linear_fc2), shapes):
         for e in range(2):
             linear.register_parameter(
-                f"weight{e}", torch.nn.Parameter(quantizer(_mx_dense(shape, 2 * rank + e, device)))
+                f"weight{e}",
+                torch.nn.Parameter(
+                    quantizer(_mx_dense(shape, 2 * rank + e, device))
+                    if weight_format == "mxfp8"
+                    else _mx_dense(shape, 2 * rank + e, device)
+                ),
             )
     runtime = ReplicaExpertRuntime(
         experts=experts,
@@ -192,7 +201,31 @@ def test_nccl_mxfp8_runtime_te_forward_and_dgrad(ep_group, expert_tp_group, swiz
         torch.cat((torch.arange(2 * size, device=device), placements.flatten())), placements
     )
     try:
-        assert runtime.weight_format == "mxfp8"
+        assert runtime.weight_format == weight_format
+        if weight_format == "bf16":
+            runtime.start_prefetch(plan)
+            runtime.wait_prefetch(plan)
+            inputs, outputs, expected_grads = [], [], []
+            for p, shape in enumerate(shapes):
+                weight = runtime.projections[p].runtime_parameters[2]
+                inp = _mx_dense((16, shape[1]), 0, device).requires_grad_()
+                inputs.append(inp)
+                outputs.append(torch.nn.functional.linear(inp, weight))
+                reference = _mx_dense(shape, table[rank][0], device)
+                expected_grads.append(torch.ones_like(outputs[-1]) @ reference)
+            # Reuse storage for another forward, then restore the old plan as
+            # the dispatcher's backward hook does. Saved weight views must
+            # observe the restored bytes without a spurious version error.
+            other = torch.flip(placements, dims=(1,))
+            other_plan = ReplicaPlan(None, other)
+            runtime.start_prefetch(other_plan)
+            runtime.wait_prefetch(other_plan)
+            runtime.start_backward_prefetch(plan)
+            runtime.wait_prefetch_for_backward(plan)
+            sum(output.sum() for output in outputs).backward()
+            for inp, expected in zip(inputs, expected_grads):
+                torch.testing.assert_close(inp.grad, expected, rtol=0, atol=0)
+            return
         for direction in (_WeightDirection.FORWARD, _WeightDirection.BACKWARD):
             runtime.start_prefetch(plan, direction)
             runtime.wait_prefetch(plan)

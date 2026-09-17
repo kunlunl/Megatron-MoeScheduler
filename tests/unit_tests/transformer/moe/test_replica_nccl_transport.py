@@ -227,8 +227,24 @@ def test_nccl_runtime_forward_and_dgrad(
                 torch.testing.assert_close(inp.grad, expected, rtol=0, atol=0)
             return
         for direction in (_WeightDirection.FORWARD, _WeightDirection.BACKWARD):
+            if direction is _WeightDirection.BACKWARD:
+                # FSDP recreates native transpose caches after forward. The
+                # runtime must refresh its wrappers and source pointer tables.
+                for parameter in runtime.source_parameters:
+                    parameter.__fsdp_param__ = True
+                    parameter._columnwise_data = parameter._columnwise_data.clone()
+                    parameter._columnwise_scale_inv = parameter._columnwise_scale_inv.clone()
+                with monkeypatch.context() as capture_patch:
+                    capture_patch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+                    with pytest.raises(RuntimeError, match="CUDA-graph source pointers"):
+                        runtime.prepare_runtime_parameters()
             runtime.start_prefetch(plan, direction)
             runtime.wait_prefetch(plan)
+            for projection in runtime.projections:
+                for parameter, source in zip(projection.runtime_parameters, projection.parameters):
+                    assert (
+                        parameter._columnwise_data.data_ptr() == source._columnwise_data.data_ptr()
+                    )
             for p, shape in enumerate(shapes):
                 for slot, expert in enumerate(table[rank]):
                     actual_weight = runtime.projections[p].virtual_weight[slot]

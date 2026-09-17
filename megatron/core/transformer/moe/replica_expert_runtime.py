@@ -369,8 +369,30 @@ class _ReplicaProjection:
             self._storage_ptrs(source, f"Replica expert runtime {self.name} expert {index}")
             for index, source in enumerate(sources)
         )
+        # FSDP recreates MXFP8 transpose caches while unsharding for backward.
+        # Refresh both transport pointer tables and the native TE wrappers.
+        # Other owners retain the fixed-address contract, as does CUDA capture.
+        storage_changed = (
+            not directional
+            and self.source_storage_ptrs is not None
+            and storage_ptrs != self.source_storage_ptrs
+        )
+        if storage_changed:
+            if not all(getattr(p, "__fsdp_param__", False) for p in self.parameters) or (
+                torch.cuda.is_current_stream_capturing()
+            ):
+                raise RuntimeError(
+                    f"Replica expert runtime {self.name} parameter storage changed after binding; "
+                    "this would invalidate CUDA-graph source pointers."
+                )
+            for parameter, source in zip(self.runtime_parameters or (), sources):
+                if self.weight_format == "bf16":
+                    parameter.data = source
+                else:
+                    for field in _MXFP8_COMPONENTS:
+                        setattr(parameter, field, getattr(source, field))
         # Directional GTP BF16 storage is tracked per binding instead.
-        if not directional and self.source_storage_ptrs is None:
+        if not directional and (self.source_storage_ptrs is None or storage_changed):
             self.source_storage_ptrs = storage_ptrs
             if self.gtp_leader is None:
                 bindings = (self.forward, self.backward)
@@ -385,18 +407,19 @@ class _ReplicaProjection:
                         if table is None:
                             continue
                         component = component_offset + row
-                        host_row = host_table[row]
+                        # Do not overwrite a pinned staging row that a previous
+                        # asynchronous pointer-table upload may still be reading.
+                        host_row = (
+                            torch.empty_like(host_table[row], pin_memory=False)
+                            if storage_changed
+                            else host_table[row]
+                        )
                         host_row.copy_(
                             torch.tensor(
                                 [ptrs[component] for ptrs in storage_ptrs], dtype=torch.int64
                             )
                         )
-                        table.copy_(host_row, non_blocking=True)
-        elif not directional and storage_ptrs != self.source_storage_ptrs:
-            raise RuntimeError(
-                f"Replica expert runtime {self.name} parameter storage changed after binding; "
-                "this would invalidate CUDA-graph source pointers."
-            )
+                        table.copy_(host_row, non_blocking=not storage_changed)
 
         native_grads = tuple(self.native_grad)
         for index, grad in enumerate(native_grads):

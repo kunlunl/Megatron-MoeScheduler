@@ -4,11 +4,15 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 import torch.distributed as dist
 
 from megatron.core.transformer.moe.moe_scheduler import ExpertDispatch
 from megatron.core.transformer.moe.replica_weight_transport import HomeExpertPlacement
+
+logger = logging.getLogger(__name__)
 
 
 class HomeExpertDispatch(ExpertDispatch):
@@ -28,6 +32,7 @@ class HomeExpertDispatch(ExpertDispatch):
         self._pending = None
         self._completed_version = 0
         self._failed = False
+        self._layer_number = None
 
     def bind_transport(self, transport):
         """Borrow the existing per-layer transport; Peer-TMA is a reserved path."""
@@ -48,7 +53,7 @@ class HomeExpertDispatch(ExpertDispatch):
 
     def dispatch(self, experts, placement: HomeExpertPlacement, context):
         """Snapshot only the physical plan; never snapshot pre-update parameter values."""
-        del experts, context
+        del experts
         if self.transport is None:
             raise RuntimeError("Bind a home transport before dispatch.")
         if placement.version <= self._completed_version:
@@ -56,6 +61,7 @@ class HomeExpertDispatch(ExpertDispatch):
         if self._pending is not None:
             raise RuntimeError("Home exchange already has a pending proposal.")
         self._pending = self.transport.prepare_home_exchange(placement)
+        self._layer_number = getattr(context, "layer_number", None)
 
     @torch.no_grad()
     def step(self):
@@ -92,6 +98,16 @@ class HomeExpertDispatch(ExpertDispatch):
             self._failed = True
             raise
         version = self._pending.placement.version
+        if dist.get_rank(self.transport.config.group) == 0:
+            sources = self._pending.placement.source_slots.flatten()
+            moved = (sources != torch.arange(sources.numel(), device=sources.device)).sum().item()
+            logger.info(
+                "Home expert exchange completed: layer=%s version=%d moved_slots=%d/%d",
+                self._layer_number,
+                version,
+                moved,
+                sources.numel(),
+            )
         self._pending = None
         self._completed_version = version
         return version

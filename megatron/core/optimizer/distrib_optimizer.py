@@ -3256,13 +3256,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         update_successful = super().step_with_ready_grads()
 
-        should_sync_params = not self.ddp_config.overlap_param_gather and not getattr(
-            self, '_defer_param_sync', False
+        should_sync_params = (
+            not self.ddp_config.overlap_param_gather
+            and not getattr(self, '_defer_param_sync', False)
+            and not getattr(self, '_home_exchange_defer_param_sync', False)
         )
         timers = self.config.timers
         if timers is not None and (self.ddp_config.use_megatron_fsdp or should_sync_params):
             timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)
-        if self.ddp_config.use_megatron_fsdp:
+        if self.ddp_config.use_megatron_fsdp and not getattr(
+            self, '_home_exchange_defer_param_sync', False
+        ):
             # Optionally all-gather Megatron-FSDP sharded main weights
             # early in preparation for the subsequent forward pass.
             for model_chunk in self.model_chunks:

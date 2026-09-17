@@ -56,8 +56,8 @@ package "Scheduler contract" {
 
   abstract class ExpertDispatch {
     {static} + dispatcher_name: str
-    + supports(physical_to_logical_map, context): bool
-    {abstract} + dispatch(experts, physical_to_logical_map, context)
+    + supports(physical_source_slots, context): bool
+    {abstract} + dispatch(experts, physical_source_slots, context)
     + bind_experts(experts)
     + wrap_layer_input(hidden_states): Tensor
     + before_token_dispatch(hidden_states): Tensor
@@ -69,6 +69,9 @@ package "Scheduler contract" {
 
   class MoEScheduler {
     + planner: MoELoadPlanner
+    + home_expert_dispatch: Optional[HomeExpertDispatch]
+    + bind_optimizer(optimizer)
+    + step()
     + expert_dispatch: ExpertDispatch
     {static} + from_config(config, pg_collection): MoEScheduler
     + bind_experts(experts)
@@ -136,8 +139,8 @@ package "Replica expert dispatch" {
     - _active_plan: Optional[ReplicaPlan]
     - _plan_slots: list[_ReplicaPlanSlot]
     + bind_experts(experts)
-    + supports(physical_to_logical_map, context): bool
-    + dispatch(experts, physical_to_logical_map, context)
+    + supports(physical_source_slots, context): bool
+    + dispatch(experts, physical_source_slots, context)
     + wrap_layer_input(hidden_states): Tensor
     + before_token_dispatch(hidden_states): Tensor
     + before_token_combine(expert_output): Tensor
@@ -145,7 +148,7 @@ package "Replica expert dispatch" {
   }
 
   class ReplicaPlan <<value object>> {
-    + virtual_experts: Tensor
+    + virtual_experts: Optional[Tensor] (MoonEP helper only)
     + experts_to_copy: Tensor
     + version: int
   }
@@ -168,6 +171,9 @@ package "Replica expert dispatch" {
     {static} + transport_name: str
     + capabilities: ReplicaTransportCapabilities
     + prepare_plan(placement): ReplicaPreparedPlan
+    + prepare_home_exchange(placement): HomePreparedPlan
+    + start_home_exchange(sources, plan): HomeTransferHandle
+    + wait_home_exchange(handle): tuple[Tensor, ...]
     {abstract} + start_weight_sync(sources, plan): ReplicaTransferHandle
     {abstract} + wait_weight_sync(handle)
     {abstract} + start_grad_reduce(native_grads, plan, projections): ReplicaTransferHandle
@@ -237,7 +243,7 @@ PeerTmaTransport --|> ReplicaWeightTransport
 
 note right of MoELoadPlanner
   update_placement() returns
-    (physical_to_logical_map, placement_result)
+    (physical_source_slots, placement_result)
 
   reroute() returns
     (routing_map, probs)
@@ -254,4 +260,24 @@ note bottom of ReplicaExpertDispatch
   [home expert slots][replica slots] per EP rank.
 end note
 
+class HomeExpertDispatch {
+  - pending: Optional[HomePreparedPlan]
+  - state_adapter: OptimizerHomeExpertState
+  + dispatch(experts, placement, context)
+  + step(): Optional[int]
+}
+class HomeExpertPlacement {
+  + source_slots: Tensor [EP, H]
+  + version: int
+}
+MoEScheduler o-- HomeExpertDispatch
+ExpertDispatch <|-- HomeExpertDispatch
+HomeExpertDispatch --> ReplicaWeightTransport
+HomeExpertDispatch --> OptimizerHomeExpertState
+EPLBLoadPlanner --> HomeExpertPlacement
+note right of HomeExpertDispatch
+  Stages physical permutation in forward.
+  Reads current state after optimizer.step().
+  Mapping is committed by planner afterwards.
+end note
 @enduml

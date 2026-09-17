@@ -7,10 +7,10 @@ The placement policy follows the two central ideas from DeepSeek's EPLB:
 * greedily replicate the expert with the largest per-instance load; and
 * place replica instances with longest-processing-time-first (LPT) packing.
 
-The common replica dispatcher keeps every logical expert's home slot fixed, so
-this adapter applies LPT only to the transient replica slots. Token routes are
-then distributed round-robin across every physical instance of their logical
-expert using a global ordinal across the EP group.
+By default homes remain fixed. With a home update interval, capacity-constrained
+LPT periodically proposes a home permutation. Active logical ownership changes
+only after state migration. Every forward distributes logical routes across the
+committed homes and transient replicas using a global EP token ordinal.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from megatron.core.transformer.moe.moe_scheduler import (
     MoEPlacementResult,
     SchedulerContext,
 )
+from megatron.core.transformer.moe.replica_weight_transport import HomeExpertPlacement
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +76,7 @@ def _pack_replicas_with_fixed_homes(
     replica_experts: torch.Tensor,
     replica_counts: torch.Tensor,
     ep_size: int,
+    home_layout: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """LPT-pack replicas while retaining each logical expert's home rank."""
     num_logical_experts = expert_loads.numel()
@@ -99,11 +101,13 @@ def _pack_replicas_with_fixed_homes(
     rank_layout[:, :num_local_home_experts] = torch.arange(
         num_logical_experts, dtype=torch.int64, device=device
     ).view(ep_size, num_local_home_experts)
+    if home_layout is not None:
+        rank_layout[:, :num_local_home_experts].copy_(home_layout)
     if num_redundant_experts == 0:
         return physical_to_logical_map
 
     per_instance_load = expert_loads.to(torch.float32) / replica_counts
-    rank_loads = per_instance_load.view(ep_size, num_local_home_experts).sum(dim=1)
+    rank_loads = per_instance_load[rank_layout[:, :num_local_home_experts]].sum(dim=1)
     replica_loads = per_instance_load.gather(0, replica_experts)
     placement_order = torch.argsort(replica_loads, descending=True, stable=True)
     slots_used = torch.zeros(ep_size, dtype=torch.int64, device=device)
@@ -166,16 +170,105 @@ def build_eplb_placement(
     return physical_to_logical_map, logical_to_physical_map, replica_counts
 
 
+def build_eplb_home_layout(expert_loads, num_redundant_experts, ep_size):
+    """Capacity-constrained LPT: exactly H unique homes on each rank.
+
+    Use per-instance costs after greedy replication. Unlike unconstrained EPLB,
+    this always supplies one canonical training owner for every logical expert.
+    Host planning occurs only at a periodic migration boundary.
+    """
+    _, counts = _replicate_experts(expert_loads, num_redundant_experts)
+    costs = (expert_loads.float() / counts).cpu().tolist()
+    h = len(costs) // ep_size
+    if h == 0 or len(costs) % ep_size:
+        raise ValueError("Home layout requires a positive uniform home capacity.")
+    ranks = [[] for _ in range(ep_size)]
+    loads = [0.0] * ep_size
+    for expert in sorted(range(len(costs)), key=lambda i: (-costs[i], i)):
+        rank = min((r for r in range(ep_size) if len(ranks[r]) < h), key=lambda r: (loads[r], r))
+        ranks[rank].append(expert)
+        loads[rank] += costs[expert]
+    return torch.tensor(ranks, dtype=torch.int64, device=expert_loads.device)
+
+
 class EPLBLoadPlanner(MoELoadPlanner):
-    """Real-time EPLB planner with fixed home experts and transient replicas."""
+    """EPLB planner with transient replicas and optional deferred home permutations."""
 
     planner_name = "eplb"
 
-    def __init__(self, num_redundant_experts: int) -> None:
+    def __init__(self, num_redundant_experts: int, home_update_interval: int = 0) -> None:
         super().__init__()
         if num_redundant_experts < 0:
             raise ValueError("num_redundant_experts must be non-negative.")
         self.num_redundant_experts = int(num_redundant_experts)
+        if home_update_interval < 0:
+            raise ValueError("home_update_interval must be non-negative.")
+        self.home_update_interval = home_update_interval
+        self.register_buffer(
+            "active_home_layout", torch.empty(0, dtype=torch.int64), persistent=False
+        )
+        self.register_buffer(
+            "active_replica_layout", torch.empty(0, dtype=torch.int64), persistent=False
+        )
+        self.register_buffer("_load_history", torch.empty(0), persistent=False)
+        self._pending_replica_layout = None
+        self._pending_home_layout = None
+        self._pending_version = None
+        self._version = 0
+        self._steps = 0
+        self._last_proposal_step = -1
+
+    def step(self, completed_version=None):
+        """Publish new logical ownership only after the dispatcher completed exchange."""
+        if completed_version is not None:
+            if completed_version != self._pending_version:
+                raise RuntimeError("EPLB received a stale or unknown home completion.")
+            self.active_home_layout.copy_(self._pending_home_layout)
+            self._pending_home_layout = None
+            self._pending_version = None
+        elif self._pending_version is not None:
+            raise RuntimeError("EPLB cannot commit a pending layout without home completion.")
+        if self._pending_replica_layout is not None:
+            self.active_replica_layout.copy_(self._pending_replica_layout)
+            self._pending_replica_layout = None
+        self._steps += 1
+
+    def get_extra_state(self):
+        """Layout metadata saved with physical parameter slots at a step boundary."""
+        return {
+            "home_layout": self.active_home_layout.detach().cpu(),
+            "replica_layout": self.active_replica_layout.detach().cpu(),
+            "steps": self._steps,
+            "version": self._version,
+            "last_proposal_step": self._last_proposal_step,
+            "load_history": self._load_history.detach().cpu(),
+        }
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        if not self.home_update_interval:
+            destination.pop(prefix + "_extra_state", None)
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+        if not self.home_update_interval and prefix + "_extra_state" in missing_keys:
+            missing_keys.remove(prefix + "_extra_state")
+
+    def set_extra_state(self, state):
+        """Restore before the first forward; physical checkpoint topology must match."""
+        self.active_home_layout = state["home_layout"].to(self.active_home_layout.device)
+        self.active_replica_layout = state["replica_layout"].to(self.active_home_layout.device)
+        self._pending_replica_layout = None
+        self._load_history = state["load_history"].to(self._load_history.device)
+        self._steps = state["steps"]
+        self._version = state["version"]
+        self._last_proposal_step = state["last_proposal_step"]
+        self._pending_version = None
+        self._pending_home_layout = None
 
     def _validate_inputs(
         self, probs: torch.Tensor, routing_map: torch.Tensor, context: SchedulerContext
@@ -223,7 +316,7 @@ class EPLBLoadPlanner(MoELoadPlanner):
         del tokens_per_expert
         self._validate_inputs(probs, routing_map, context)
         self._validate_context(context)
-        return self.num_redundant_experts != 0
+        return self.num_redundant_experts != 0 or self.home_update_interval > 0
 
     def _get_count_matrix(
         self,
@@ -259,24 +352,105 @@ class EPLBLoadPlanner(MoELoadPlanner):
         context: SchedulerContext,
         *,
         tokens_per_expert: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, EPLBPlacementResult]:
+    ) -> tuple[Optional[HomeExpertPlacement], torch.Tensor, EPLBPlacementResult]:
         """Compute a common placement from current global EP token counts."""
         self._validate_inputs(probs, routing_map, context)
         self._validate_context(context)
         counts_from_ep_rank = self._get_count_matrix(
             routing_map, context, tokens_per_expert=tokens_per_expert
         )
-        physical_to_logical_map, logical_to_physical_map, replica_counts = build_eplb_placement(
-            counts_from_ep_rank.sum(dim=0), self.num_redundant_experts, context.ep_size
+        loads = counts_from_ep_rank.sum(dim=0)
+        h = context.num_local_experts
+        if not self.active_home_layout.numel():
+            self.active_home_layout = torch.arange(
+                context.num_logical_experts, device=loads.device
+            ).reshape(context.ep_size, h)
+            self._load_history = torch.zeros_like(loads, dtype=torch.float64)
+        if tuple(self.active_home_layout.shape) != (context.ep_size, h):
+            raise ValueError("Restored EPLB physical checkpoint has a different EP/home topology.")
+        self.active_home_layout = self.active_home_layout.to(loads.device)
+        self._load_history = self._load_history.to(loads.device)
+        if self.home_update_interval:
+            if self.active_replica_layout.ndim != 2:
+                initial, initial_counts = _replicate_experts(loads, self.num_redundant_experts)
+                layout = _pack_replicas_with_fixed_homes(
+                    loads, initial, initial_counts, context.ep_size, self.active_home_layout
+                )
+                self.active_replica_layout = layout.reshape(context.ep_size, -1)[:, h:].clone()
+            self.active_replica_layout = self.active_replica_layout.to(loads.device)
+            if tuple(self.active_replica_layout.shape) != (
+                context.ep_size,
+                self.num_redundant_experts // context.ep_size,
+            ):
+                raise ValueError("Restored EPLB checkpoint has a different replica slot topology.")
+        home_placement = None
+        if (
+            context.training
+            and self.home_update_interval
+            and self._steps > 0
+            and self._steps % self.home_update_interval == 0
+            and self._last_proposal_step != self._steps
+            and self._pending_version is None
+        ):
+            historical_loads = self._load_history.clone()
+            # Data replicas must choose identical logical ownership before their
+            # sharded optimizer states can move between corresponding EP ranks.
+            edp = getattr(context.pg_collection, "expt_dp", None)
+            if edp is not None:
+                torch.distributed.all_reduce(historical_loads, group=edp)
+            candidate = build_eplb_home_layout(
+                historical_loads, self.num_redundant_experts, context.ep_size
+            )
+            candidate_replicas, candidate_counts = _replicate_experts(
+                historical_loads, self.num_redundant_experts
+            )
+            candidate_layout = _pack_replicas_with_fixed_homes(
+                historical_loads, candidate_replicas, candidate_counts, context.ep_size, candidate
+            )
+            self._pending_replica_layout = candidate_layout.reshape(context.ep_size, -1)[
+                :, h:
+            ].clone()
+            self._last_proposal_step = self._steps
+            self._load_history.zero_()
+            if not torch.equal(candidate, self.active_home_layout):
+                self._version += 1
+                self._pending_version = self._version
+                self._pending_home_layout = candidate
+                logical_to_home = torch.argsort(self.active_home_layout.flatten())
+                home_placement = HomeExpertPlacement(logical_to_home[candidate], self._version)
+        if context.training:
+            self._load_history.add_(loads)
+        # Every microbatch copies CURRENT home sources, even while an exchange is pending.
+        if self.home_update_interval:
+            physical_to_logical_map = torch.cat(
+                (self.active_home_layout, self.active_replica_layout), dim=1
+            ).flatten()
+            replica_counts = torch.bincount(
+                physical_to_logical_map, minlength=context.num_logical_experts
+            )
+        else:
+            replicas, replica_counts = _replicate_experts(loads, self.num_redundant_experts)
+            physical_to_logical_map = _pack_replicas_with_fixed_homes(
+                loads, replicas, replica_counts, context.ep_size, self.active_home_layout
+            )
+        logical_to_physical_map = _logical_to_physical_map(
+            physical_to_logical_map, context.num_logical_experts, self.num_redundant_experts
         )
+        logical_to_home = torch.argsort(self.active_home_layout.flatten())
+        replica_layout = physical_to_logical_map.reshape(context.ep_size, -1)[:, h:]
+        replica_placement = logical_to_home[replica_layout].to(torch.int32).contiguous()
         local_expert_offsets = counts_from_ep_rank[: context.ep_rank].sum(dim=0)
-        return physical_to_logical_map, EPLBPlacementResult(
-            logical_to_physical_map=logical_to_physical_map,
-            replica_counts=replica_counts,
-            local_expert_offsets=local_expert_offsets,
-            num_physical_experts=physical_to_logical_map.numel(),
-            ep_size=context.ep_size,
-            ep_rank=context.ep_rank,
+        return (
+            home_placement,
+            replica_placement,
+            EPLBPlacementResult(
+                logical_to_physical_map=logical_to_physical_map,
+                replica_counts=replica_counts,
+                local_expert_offsets=local_expert_offsets,
+                num_physical_experts=physical_to_logical_map.numel(),
+                ep_size=context.ep_size,
+                ep_rank=context.ep_rank,
+            ),
         )
 
     def reroute(

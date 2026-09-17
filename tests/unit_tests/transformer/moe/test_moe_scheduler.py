@@ -13,6 +13,8 @@ from megatron.core.transformer.moe.moe_scheduler import (
     SchedulerContext,
 )
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 def _route_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     probs = torch.zeros(3, 4)
@@ -85,7 +87,7 @@ class _EchoStylePlanner(MoELoadPlanner):
         del probs, routing_map, context, tokens_per_expert
         if self.events is not None:
             self.events.append("update_placement")
-        return torch.tensor([0, 1, 0, 2, 3, 3]), _TestPlacementResult()
+        return None, torch.tensor([[0], [3]]), _TestPlacementResult()
 
     def reroute(
         self,
@@ -154,7 +156,7 @@ class _InvalidPlacementPlanner(_EchoStylePlanner):
         tokens_per_expert: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, MoEPlacementResult]:
         del probs, routing_map, context, tokens_per_expert
-        return torch.arange(6).reshape(2, 3), _TestPlacementResult()
+        return None, torch.arange(6), _TestPlacementResult()
 
 
 class _InvalidReroutePlanner(_EchoStylePlanner):
@@ -229,7 +231,7 @@ def test_scheduler_passes_physical_layout_to_matching_dispatcher():
         probs, routing_map, experts, context, tokens_per_expert=tokens_per_expert
     )
 
-    assert dispatch.dispatched_physical_to_logical_map.tolist() == [0, 1, 0, 2, 3, 3]
+    assert dispatch.dispatched_physical_to_logical_map.tolist() == [[0], [3]]
     assert dispatch.materialized_experts is experts
     assert output_probs.shape == output_routing_map.shape
     assert events == ["update_placement", "dispatch", "reroute"]
@@ -274,7 +276,7 @@ def test_scheduler_validates_split_planner_outputs():
     context = _context()
     experts = torch.nn.Identity()
 
-    with pytest.raises(ValueError, match="physical_to_logical_map"):
+    with pytest.raises(ValueError, match="replica"):
         MoEScheduler(
             planner=_InvalidPlacementPlanner(), expert_dispatch=_RecordingDispatch()
         ).schedule(probs, routing_map, experts, context, tokens_per_expert=tokens_per_expert)
@@ -283,3 +285,42 @@ def test_scheduler_validates_split_planner_outputs():
         MoEScheduler(
             planner=_InvalidReroutePlanner(), expert_dispatch=_RecordingDispatch()
         ).schedule(probs, routing_map, experts, context, tokens_per_expert=tokens_per_expert)
+
+
+def test_scheduler_stages_home_only_and_commits_after_exchange():
+    from megatron.core.transformer.moe.replica_weight_transport import HomeExpertPlacement
+
+    events = []
+
+    class Planner(MoELoadPlanner):
+        def update_placement(self, probs, routing_map, context, **kwargs):
+            return (
+                HomeExpertPlacement(torch.tensor([[2, 3], [0, 1]]), 1),
+                None,
+                _TestPlacementResult(),
+            )
+
+        def reroute(self, probs, routing_map, placement_result, context):
+            return routing_map, probs
+
+        def step(self, completed_version=None):
+            assert completed_version == 1
+            events.append("commit")
+
+    class Home(ExpertDispatch):
+        def dispatch(self, experts, expert_placement, context):
+            events.append("stage")
+
+        def step(self):
+            events.append("exchange")
+            return 1
+
+    replica = _RecordingDispatch()
+    scheduler = MoEScheduler(Planner(), replica, Home())
+    probs, routes, _ = _route_inputs()
+    actual_probs, actual_routes = scheduler.schedule(probs, routes, torch.nn.Identity(), _context())
+    assert events == ["stage"]
+    assert replica.dispatched_physical_to_logical_map is None
+    assert actual_probs is probs and actual_routes is routes
+    scheduler.step()
+    assert events == ["stage", "exchange", "commit"]

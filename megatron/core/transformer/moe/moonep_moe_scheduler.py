@@ -292,9 +292,7 @@ def _physical_to_logical_map_from_experts_to_copy(
     # indexing produces a dynamic-size tensor and synchronizes with the host,
     # which is illegal during CUDA graph capture. Fixed-shape selection also
     # lets graph replay handle a different active-slot mask each microbatch.
-    return torch.cat(
-        (logical_ids, torch.where(valid, replica_logical_ids, -1)), dim=1
-    ).reshape(-1)
+    return torch.cat((logical_ids, torch.where(valid, replica_logical_ids, -1)), dim=1).reshape(-1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,15 +380,16 @@ class MoonEPLoadPlanner(MoELoadPlanner):
     @staticmethod
     def _identity_placement(
         routing_map: torch.Tensor, context: SchedulerContext
-    ) -> tuple[torch.Tensor, MoonEPPlacementResult]:
+    ) -> tuple[None, torch.Tensor, MoonEPPlacementResult]:
         return (
-            torch.arange(context.num_logical_experts, dtype=torch.long, device=routing_map.device),
+            None,
+            torch.empty((context.ep_size, 0), dtype=torch.long, device=routing_map.device),
             MoonEPPlacementResult(),
         )
 
     def _single_rank_placement(
         self, routing_map: torch.Tensor, context: SchedulerContext
-    ) -> tuple[torch.Tensor, MoonEPPlacementResult]:
+    ) -> tuple[None, torch.Tensor, MoonEPPlacementResult]:
         num_redundant_experts = self._resolve_num_redundant_experts(context)
         num_physical_experts = context.num_logical_experts + num_redundant_experts
         physical_to_logical_map = torch.full(
@@ -399,7 +398,13 @@ class MoonEPLoadPlanner(MoELoadPlanner):
         physical_to_logical_map[: context.num_logical_experts] = torch.arange(
             context.num_logical_experts, dtype=torch.long, device=routing_map.device
         )
-        return physical_to_logical_map, MoonEPPlacementResult()
+        return (
+            None,
+            physical_to_logical_map.reshape(context.ep_size, -1)[
+                :, context.num_local_experts :
+            ].contiguous(),
+            MoonEPPlacementResult(),
+        )
 
     @staticmethod
     def _single_rank_reroute(
@@ -444,7 +449,7 @@ class MoonEPLoadPlanner(MoELoadPlanner):
         context: SchedulerContext,
         *,
         tokens_per_expert: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, MoonEPPlacementResult]:
+    ) -> tuple[None, torch.Tensor, MoonEPPlacementResult]:
         """Return PR #6892's physical layout and explicit reroute state."""
         del tokens_per_expert
         self._validate_inputs(probs, routing_map, context)
@@ -465,8 +470,12 @@ class MoonEPLoadPlanner(MoELoadPlanner):
         physical_to_logical_map = _physical_to_logical_map_from_experts_to_copy(
             experts_to_copy, context
         )
-        return physical_to_logical_map, MoonEPPlacementResult(
-            topk_indices=topk_indices, workspace=workspace
+        return (
+            None,
+            physical_to_logical_map.reshape(context.ep_size, -1)[
+                :, context.num_local_experts :
+            ].contiguous(),
+            MoonEPPlacementResult(topk_indices=topk_indices, workspace=workspace),
         )
 
     @nvtx_decorator(message="virtual_expert_reroute")

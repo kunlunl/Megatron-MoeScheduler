@@ -27,7 +27,7 @@ class ReplicaWeightLayout(Enum):
 class ReplicaOwnership:
     """Canonical source locations, independent of execution placement.
 
-    With no tables, logical expert ``e`` lives at ``divmod(e, home_experts)``.
+    With no tables, source slot ``s`` lives at ``divmod(s, home_experts)``.
     Explicit tables are an extension point for nonuniform ownership, not an
     optimizer-state migration protocol. Ranks always refer to the EP group.
     """
@@ -45,7 +45,7 @@ class ReplicaOwnership:
 
 @dataclass(frozen=True, slots=True, eq=False)
 class ReplicaPlacement:
-    """Logical experts in destination slots, not a backend communication schedule.
+    """Physical source-home slots in replica destinations, independent of logical identity.
 
     ``slot_to_expert`` is int32 ``[ep_size, local_replica_slots]``; -1 means
     unused. The caller retains the tensor without mutation through backward.
@@ -86,6 +86,35 @@ class ReplicaTransferHandle:
     keepalive: tuple[Any, ...] = ()
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class HomeExpertPlacement:
+    """Destination home slots to CURRENT physical sources; no logical identities.
+
+    ``source_slots`` is an integer [EP, H] permutation of ``range(EP * H)``.
+    ``version`` identifies a single deferred proposal within one layer.
+    """
+
+    source_slots: torch.Tensor
+    version: int
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class HomePreparedPlan:
+    """Immutable host schedule for a deferred home permutation."""
+
+    placement: HomeExpertPlacement
+    transport: ReplicaWeightTransport
+    metadata: Any
+
+
+@dataclass(frozen=True, slots=True, eq=False)
+class HomeTransferHandle:
+    """Completion and staging tensors; original slot storage is never overwritten."""
+
+    transfer: ReplicaTransferHandle
+    received: tuple[torch.Tensor, ...]
+
+
 @dataclass(frozen=True, slots=True)
 class ReplicaTransportCapabilities:
     """Conservative promises of an implemented backend, not future aspirations."""
@@ -95,6 +124,7 @@ class ReplicaTransportCapabilities:
     device_plan: bool = False
     cuda_graph: bool = False
     explicit_ownership: bool = False
+    home_exchange: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +187,20 @@ class ReplicaWeightTransport(ABC):
 
     transport_name = "abstract"
     capabilities = ReplicaTransportCapabilities()
+
+    def prepare_home_exchange(self, placement: HomeExpertPlacement) -> HomePreparedPlan:
+        """Reserve the exchange interface for backends including Peer-TMA."""
+        raise NotImplementedError(f"{self.transport_name} home expert exchange is not implemented.")
+
+    def start_home_exchange(
+        self, *, sources: tuple[torch.Tensor, ...], plan: HomePreparedPlan
+    ) -> HomeTransferHandle:
+        """Exchange typed [H, ...] components into separate staging storage."""
+        raise NotImplementedError(f"{self.transport_name} home expert exchange is not implemented.")
+
+    def wait_home_exchange(self, handle: HomeTransferHandle) -> tuple[torch.Tensor, ...]:
+        """Order all received components before the caller installs them."""
+        raise NotImplementedError(f"{self.transport_name} home expert exchange is not implemented.")
 
     def __init__(self, config: ReplicaTransportConfig) -> None:
         self.config = config

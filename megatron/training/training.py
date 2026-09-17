@@ -2996,19 +2996,15 @@ def train_step(
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    from megatron.core.transformer.moe.home_expert_training import (
+        finish_home_expert_step,
+        prepare_home_expert_step,
+    )
+
+    home_schedulers = prepare_home_expert_step(model, optimizer)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
-    # get max attention logit for logging and run clip_qk()
-    # Part of MuonClip Optimizer step
-    log_max_attention_logit = 0
-    if args.qk_clip or args.log_max_attention_logit:
-        log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
-
     timers('optimizer').stop()
-
-    # Checkpoint params with parameter names.
-    if save_params_in_this_iteration:
-        _save_state_dict(attr_name="data", label="params")
 
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
     pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
@@ -3024,6 +3020,16 @@ def train_step(
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
     update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
+    finish_home_expert_step(home_schedulers, optimizer, update_successful)
+
+    # get max attention logit for logging and run clip_qk()
+    # Part of MuonClip Optimizer step
+    log_max_attention_logit = 0
+    if args.qk_clip or args.log_max_attention_logit:
+        log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
+
+    if save_params_in_this_iteration:
+        _save_state_dict(attr_name="data", label="params")
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)

@@ -91,14 +91,14 @@ def test_echo_planner_reroutes_hot_expert_tokens_to_echo_slot():
     probs, routing_map, tokens_per_expert = _hot_expert_inputs()
     context = _echo_context()
     planner = EchoLoadPlanner(2)
-    physical_to_logical_map, placement_result = planner.update_placement(
+    home_placement, physical_to_logical_map, placement_result = planner.update_placement(
         probs, routing_map, context, tokens_per_expert=tokens_per_expert
     )
     physical_routing_map, physical_probs = planner.reroute(
         probs, routing_map, placement_result, context
     )
 
-    assert physical_to_logical_map.tolist() == [0, 1, -1, 2, 3, 0]
+    assert physical_to_logical_map.tolist() == [[-1], [0]]
     assert physical_routing_map.shape == (4, 6)
     assert physical_routing_map[:, 0].sum().item() == 3
     assert physical_routing_map[:, 5].sum().item() == 1
@@ -115,14 +115,16 @@ def test_echo_planner_should_not_plan_without_idle_experts():
     )
 
 
-def test_replica_dispatch_supports_configured_e_plus_r_layout():
+def test_replica_dispatch_supports_configured_physical_source_table():
     context = _echo_context()
     dispatcher = _replica_dispatcher()
     smaller_dispatcher = _replica_dispatcher(num_idle_experts=2)
 
-    assert dispatcher.supports(torch.tensor([0, 1, 2, 0, 2, 3, 1, -1]), context)
-    assert smaller_dispatcher.supports(torch.tensor([0, 1, 2, 2, 3, 0]), context)
-    assert not smaller_dispatcher.supports(torch.arange(8), context)
+    assert dispatcher.supports(torch.tensor([[2, 0], [1, -1]]), context)
+    assert smaller_dispatcher.supports(torch.tensor([[2], [0]]), context)
+    assert not smaller_dispatcher.supports(torch.tensor([[2, 0], [1, -1]]), context)
+    assert not dispatcher.supports(torch.tensor([[2.0, 0.0], [1.0, -1.0]]), context)
+    assert not dispatcher.supports(torch.tensor([0, 1, 2, 0, 2, 3, 1, -1]), context)
     assert not dispatcher.supports(torch.arange(10), context)
 
 
@@ -169,7 +171,7 @@ def test_echo_planner_requires_ep_group_for_multi_ep():
 
 def test_replica_dispatch_lowers_placement_to_runtime_plan():
     context = _echo_context()
-    physical_to_logical_map = torch.tensor([0, 1, 2, 2, 3, 0])
+    physical_to_logical_map = torch.tensor([[2], [0]])
     dispatcher = _replica_dispatcher(num_idle_experts=2)
 
     class _Runtime:
@@ -188,7 +190,7 @@ def test_replica_dispatch_lowers_placement_to_runtime_plan():
     dispatcher.dispatch(torch.nn.Identity(), physical_to_logical_map, context)
 
     assert runtime.last_plan is runtime.started_plan
-    assert runtime.started_plan.virtual_experts is physical_to_logical_map
+    assert runtime.started_plan.virtual_experts is None
     assert runtime.started_plan.experts_to_copy.dtype == torch.int32
     assert runtime.started_plan.experts_to_copy.tolist() == [[2], [0]]
 
@@ -294,9 +296,7 @@ def test_replica_dispatch_preserves_runtime_backward_order():
     dispatcher = _replica_dispatcher()
     dispatcher.runtime = _Runtime()
     hidden = dispatcher.wrap_layer_input(torch.ones((), requires_grad=True))
-    dispatcher.dispatch(
-        torch.nn.Identity(), torch.tensor([0, 1, 2, -1, 2, 3, 0, 1]), _echo_context()
-    )
+    dispatcher.dispatch(torch.nn.Identity(), torch.tensor([[2, -1], [0, 1]]), _echo_context())
     hidden = dispatcher.before_token_dispatch(hidden)
     hidden = _BackwardMarker.apply(hidden, "dispatch_backward")
     hidden = dispatcher.after_token_dispatch(hidden)

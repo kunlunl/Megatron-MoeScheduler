@@ -149,7 +149,7 @@ token preprocessing, dispatch, expert computation, combine, and backward flow.
 The planner contract is split into two phases:
 
 ```python
-physical_to_logical_map, placement_result = planner.update_placement(
+home_expert_placement, replica_expert_placement, placement_result = planner.update_placement(
     probs, routing_map, context
 )
 routing_map, probs = planner.reroute(
@@ -157,17 +157,18 @@ routing_map, probs = planner.reroute(
 )
 ```
 
-`physical_to_logical_map` always means rank-major physical slot to logical
-expert id, with `-1` marking an unused slot. `placement_result` is a concrete
-planner's explicit intermediate state; the scheduler treats it as opaque and
-passes it back only to the planner that produced it. `reroute()` returns dense
-`[num_tokens, num_physical_experts]` routing and probability tensors.
+Logical mappings are private to the planner. `home_expert_placement` is an
+optional `HomeExpertPlacement(source_slots, version)` with a `[EP, H]` source
+permutation. `replica_expert_placement` is an optional `[EP, S]` integer table,
+with `-1` for inactive replicas. Both tables are destination-major and encode
+**physical** sources as `rank * H + local_home_slot`. `placement_result` is
+opaque reroute state. `reroute()` returns dense physical route/probability tensors.
 
-The `ReplicaExpertDispatch` consumes only
-`physical_to_logical_map` and owns the common weight-prefetch and
-gradient-reduction lifecycle. It delegates TE/GTP parameter state to
-`ReplicaExpertRuntime`, which delegates communication and transport-owned
-storage to `ReplicaWeightTransport`.
+`MoEScheduler` calls `HomeExpertDispatch` and `ReplicaExpertDispatch` directly.
+Home dispatch stages metadata until `scheduler.step()`; replica dispatch starts
+weight prefetch immediately and retains the source table through backward. Both
+use the same transport implementation. Replica runtime owns TE/GTP bindings and
+gradient handoff. Transport never interprets logical identity or optimizer state.
 
 ## Class Diagram
 
@@ -176,6 +177,9 @@ classDiagram
     MoELayer --> MoEScheduler
     MoEScheduler o-- MoELoadPlanner
     MoEScheduler o-- ReplicaExpertDispatch
+    MoEScheduler o-- HomeExpertDispatch
+    ExpertDispatch <|-- HomeExpertDispatch
+    HomeExpertDispatch --> ReplicaWeightTransport
     MoELoadPlanner <|-- EchoLoadPlanner
     MoELoadPlanner <|-- EPLBLoadPlanner
     MoELoadPlanner <|-- MoonEPLoadPlanner
@@ -207,7 +211,7 @@ The same architecture is available as standalone PlantUML sources:
 | Type | Config value | Implementation | Status |
 | --- | --- | --- | --- |
 | Planner | `echo` | `EchoLoadPlanner` | CUDA/Triton assignment and token reroute aligned with Echo PR #2368. |
-| Planner | `eplb` | `EPLBLoadPlanner` | Greedy hot-expert replication, fixed-home LPT placement, and global round-robin rerouting. |
+| Planner | `eplb` | `EPLBLoadPlanner` | Greedy replication, optional periodic home LPT permutations, and global round-robin rerouting. |
 | Planner | `moon_ep` | `MoonEPLoadPlanner` | PR #6892 fused per-step placement: one cooperative kernel with symmetric-memory histogram exchange. |
 | Expert dispatch | `replica_peer_tma` | `ReplicaExpertDispatch` | One replica lifecycle implementation; the type currently selects `PeerTmaTransport`. |
 | Expert dispatch | `replica_hybridep` | Same dispatcher, `HybridEPWeightTransport` | Placeholder; raises `NotImplementedError` before transport allocation. |
@@ -225,10 +229,10 @@ metadata in the public interface.
 3. `MoELayer` calls `MoEScheduler.schedule()`.
 4. `MoELoadPlanner.should_plan()` decides whether scheduling is needed.
 5. If planning is skipped, the original router tensors are returned unchanged.
-6. Otherwise, `update_placement()` returns `physical_to_logical_map` plus an
+6. `update_placement()` returns optional home/replica source tables and an
    opaque `MoEPlacementResult`.
-7. `ExpertDispatch` lowers the placement map and asynchronously starts replica
-   weight materialization on the destination ranks.
+7. The scheduler stages a home proposal and asynchronously starts current-home
+   replica copies. Pending home ownership is never used by this forward.
 8. `reroute()` converts the original logical routes to physical routes while
    expert-weight communication is in flight.
 9. The existing token dispatcher consumes the physical routing tensors and
@@ -274,8 +278,8 @@ For EPLB, set `moe_scheduler_planner_type: eplb`. `EPLBLoadPlanner` gathers the
 current logical-expert loads across the EP group, greedily assigns redundant
 instances according to `load / replica_count`, and LPT-packs those instances
 into the fixed replica slots. It follows the core replication and packing
-policy of [DeepSeek EPLB](https://github.com/deepseek-ai/EPLB), while retaining
-rank-major home experts for compatibility with the common replica dispatcher.
+policy of [DeepSeek EPLB](https://github.com/deepseek-ai/EPLB). Homes remain fixed
+by default; `moe_scheduler_home_update_interval` enables periodic migration.
 
 All planners use the transport-backed `ReplicaExpertRuntime`. It supports an
 `E + R` runtime layout, where `R` is positive and divisible by the EP size.
@@ -348,13 +352,14 @@ materialization ran.
 
 ## Replica Transport Contract
 
-The planner chooses logical experts for execution slots. The single dispatcher
-retains an immutable placement slot through forward/backward and assigns a
+The planner lowers logical choices to physical source slots. Replica dispatch
+retains an immutable source table through forward/backward and assigns a
 dispatcher-local generation. `ReplicaExpertRuntime` wraps that slot table in
 `ReplicaPlacement`, with a separate `ReplicaOwnership` descriptor. The current
 owner mapping is uniform and fixed; optional explicit owner tables reserve an
-extension point and are rejected by Peer-TMA and NCCL P2P. This refactor does not implement
-native-owner or optimizer-state migration, or relax the fixed-home E+R layout.
+extension point and are rejected by Peer-TMA and NCCL P2P. Periodic home exchange
+moves contents among these fixed physical sources, so replica transport needs
+no logical ownership table. Each rank still has H home slots followed by S replicas.
 
 `transport.prepare_plan(placement)` produces a `ReplicaPreparedPlan` belonging
 to that exact transport instance. Peer-TMA keeps device metadata; NCCL
@@ -406,7 +411,7 @@ weight selection and optimizer handoff remain in `ReplicaExpertRuntime`.
 
 `prepare_plan()` performs one synchronous device-to-host copy of the global
 `[EP, replica_slots]` placement per immutable microbatch plan. It validates
-logical expert IDs, skips `-1`, and derives owners using uniform canonical
+physical source IDs, skips `-1`, and derives owners using uniform canonical
 ownership. The prepared schedule stores only peer ranks, native indices and
 replica slots. It never retains source addresses, so backward may use newly
 materialized weights. All ranks must provide the same placement; no extra
@@ -591,3 +596,66 @@ We ❤️ contributions! Ways to contribute:
   year={2019}
 }
 ```
+
+
+## Periodic Home Expert Exchange (NCCL)
+
+Enable alongside the existing scheduler configuration:
+
+```yaml
+moe_enable_scheduler: true
+moe_scheduler_planner_type: eplb
+moe_scheduler_expert_dispatcher_type: replica_nccl
+moe_scheduler_num_idle_experts: 4
+moe_scheduler_home_update_interval: 50
+```
+
+The first 50 successful updates collect logical load history. The first forward
+after that interval proposes a permutation; migration runs after that iteration's
+optimizer update. Exactly H unique canonical homes remain on every rank. LPT uses
+per-instance load after greedy replica selection. This is a constrained EPLB
+policy: unrestricted placements cannot always preserve a fixed home capacity.
+
+EPLB keeps active and pending home/replica mappings. In periodic mode both logical
+placements are committed together at the successful-step boundary; unchanged
+replica placements still issue fresh weight copies on every microbatch. Each
+microbatch reroutes against the active mapping and current home slots.
+`HomeExpertDispatch.dispatch` snapshots only the proposal, never stale weights.
+At the drained optimizer boundary, `MoEScheduler.step()` calls home dispatch
+first and `planner.step(completed_version)` second. Failed optimizer updates
+retain both the old mapping and pending proposal.
+
+`prepare_home_expert_step(model, optimizer)` and `finish_home_expert_step(...)`
+wire this boundary into the Megatron training loop. Custom training loops must
+use the same boundary, or bind a state adapter and arrange communication fences
+before calling each scheduler's `.step()`. All replica microbatches must finish.
+Next-step DDP/FSDP gathers are deferred during migration, including the chained
+optimizer MXFP8 gather path, and restarted only after weights are refreshed.
+
+NCCL exchanges typed state components into separate staging buffers. Cyclic
+permutations and same-rank swaps cannot overwrite a source before it is read.
+The optimizer adapter moves authoritative parameters and tensor-valued optimizer
+states in place. Parameter objects, master/moment addresses and bucket views are
+preserved. Uneven or empty DistributedOptimizer/FSDP shards are reconstructed
+over their optimizer DP group, exchanged over EP, and sliced into each destination's
+own shard range. Existing optimizer copy/cast functions regenerate BF16/MXFP8
+model weights and scales. This first implementation uses a full-layer state
+snapshot and a device fence; migration is intentionally outside CUDA capture.
+
+Supported adapter storage is resident, uncompressed elementwise optimizer state,
+including ordinary Adam masters and moments, DDP mixed-precision masters,
+DistributedOptimizer shards and Megatron-FSDP main-weight buffers. Precision-aware
+compressed states, CPU/chunked optimizer offload, layer-wise optimizers and non-elementwise optimizer
+states require dedicated adapters and are rejected. Peer-TMA exposes explicit
+home-exchange placeholders; its existing replica APIs remain supported.
+
+Checkpoints retain physical parameter slots and the EPLB `_extra_state` mapping,
+step counter and load history. Resume requires the same EP/home-slot topology.
+This format does not yet support expert-parallel resharding or importing into a
+model without scheduler mapping metadata. Save/load and inference must retain
+the scheduler; converting to canonical logical checkpoint keys is future work.
+
+`test_home_expert_exchange.py` checks delayed reads of post-update weights,
+local/cross-rank cycles, exact Adam continuation over repeated updates, mixed
+tensor formats, repeated consumer-stream waits, uneven/empty optimizer shards,
+active/pending routing, checkpoint metadata and explicit unsupported operations.

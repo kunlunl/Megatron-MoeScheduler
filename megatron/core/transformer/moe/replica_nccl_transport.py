@@ -12,6 +12,9 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.transformer.moe.replica_weight_transport import (
+    HomeExpertPlacement,
+    HomePreparedPlan,
+    HomeTransferHandle,
     ReplicaGradDestination,
     ReplicaPlacement,
     ReplicaPreparedPlan,
@@ -127,7 +130,9 @@ class NcclP2PTransport(ReplicaWeightTransport):
 
     transport_name = "replica_nccl"
     capabilities = ReplicaTransportCapabilities(
-        weight_formats=("bf16", "mxfp8"), grad_dtypes=(torch.bfloat16, torch.float32)
+        weight_formats=("bf16", "mxfp8"),
+        grad_dtypes=(torch.bfloat16, torch.float32),
+        home_exchange=True,
     )
 
     def __init__(self, config: ReplicaTransportConfig) -> None:
@@ -209,6 +214,85 @@ class NcclP2PTransport(ReplicaWeightTransport):
             raise ValueError("Set the current CUDA device to the replica_nccl transport device.")
         if torch.cuda.is_current_stream_capturing():
             raise ValueError("replica_nccl does not support CUDA capture with host schedules.")
+
+    def prepare_home_exchange(self, placement: HomeExpertPlacement) -> HomePreparedPlan:
+        """Snapshot and validate a physical permutation, without capturing weights."""
+        self._check_available()
+        table = placement.source_slots
+        h = self.config.num_local_home_experts
+        if table.dtype not in (torch.int32, torch.int64) or tuple(table.shape) != (
+            self.config.world_size,
+            h,
+        ):
+            raise ValueError("Home placement must be an integer [EP, H] source-slot table.")
+        host = table.detach().cpu().clone()
+        if sorted(host.flatten().tolist()) != list(range(host.numel())):
+            raise ValueError("Home placement must be a permutation of all physical home slots.")
+        if placement.version <= 0:
+            raise ValueError("Home proposal version must be positive.")
+        snapshot = HomeExpertPlacement(host, placement.version)
+        return HomePreparedPlan(snapshot, self, _compile_schedule(host.tolist(), h, self.rank))
+
+    @torch.no_grad()
+    def start_home_exchange(self, *, sources, plan) -> HomeTransferHandle:
+        """Receive before install: cycles, local swaps, mixed dtypes and shapes are safe."""
+        self._check_available()
+        if plan.transport is not self:
+            raise ValueError("Home plan belongs to a different transport.")
+        if not sources:
+            raise ValueError("Home exchange requires at least one state component.")
+        h = self.config.num_local_home_experts
+        for source in sources:
+            if (
+                source.device != self.config.device
+                or source.ndim < 2
+                or source.shape[0] != h
+                or not source.is_contiguous()
+            ):
+                raise ValueError("Home components must be contiguous device tensors [H, ...].")
+        schedule = plan.metadata
+        producer = torch.cuda.current_stream(self.config.device)
+        self._stream.wait_stream(producer)
+        self._inflight = [(event, refs) for event, refs in self._inflight if not event.query()]
+        with torch.cuda.stream(self._stream):
+            received = tuple(torch.empty_like(source) for source in sources)
+            buffers = []
+            for source, destination in zip(sources, received):
+                source.record_stream(self._stream)
+                numel = source[0].numel()
+                sends = {
+                    route.peer: torch.cat([source[i].reshape(-1) for i in route.home_indices])
+                    for route in schedule.sends
+                }
+                remote, keepalive = self._exchange(
+                    sends,
+                    {route.peer: len(route.replica_slots) * numel for route in schedule.receives},
+                    source.dtype,
+                )
+                buffers.append(keepalive)
+                for index, slot in zip(schedule.local.home_indices, schedule.local.replica_slots):
+                    destination[slot].copy_(source[index])
+                for route in schedule.receives:
+                    for i, slot in enumerate(route.replica_slots):
+                        destination[slot].view(-1).copy_(
+                            remote[route.peer][i * numel : (i + 1) * numel]
+                        )
+            return HomeTransferHandle(self._finish(plan, sources, received, buffers), received)
+
+    def wait_home_exchange(self, handle: HomeTransferHandle) -> tuple[torch.Tensor, ...]:
+        """Finish a rare home exchange and release its large transport keepalives.
+
+        Home migrations run at a drained optimizer boundary. Unlike microbatch
+        replica prefetch, this wait also blocks the host so completed snapshots
+        do not accumulate across every layer until the next forward pass.
+        Installation remains on the caller's stream, protected by record_stream.
+        """
+        self.wait_weight_sync(handle.transfer)
+        handle.transfer.completion.synchronize()
+        self._inflight = [(event, refs) for event, refs in self._inflight if not event.query()]
+        for tensor in handle.received:
+            tensor.record_stream(torch.cuda.current_stream(self.config.device))
+        return handle.received
 
     def _projection_index(self, projection_index: int) -> None:
         if projection_index not in (0, 1):

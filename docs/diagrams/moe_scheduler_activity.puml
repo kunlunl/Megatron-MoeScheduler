@@ -33,18 +33,21 @@ if (MoEScheduler configured?) then (yes)
     |Concrete MoELoadPlanner|
     :update_placement(probs, routing_map, context);
     note right
-      Returns physical_to_logical_map
-      plus a planner-private placement_result.
+      Returns optional home and replica physical
+      source-slot tables plus private reroute state.
     end note
 
     |MoEScheduler.schedule|
-    :Validate physical_to_logical_map;
+    :Validate physical source-slot tables;
+    if (Home proposal present?) then (yes)
+      :home_expert_dispatch.dispatch: stage metadata only;
+    endif
     :expert_dispatch.supports(map, context);
     if (Placement supported?) then (yes)
       |ReplicaExpertDispatch|
       :dispatch(experts, map, context);
       :Acquire a stable plan slot;
-      :Copy each rank's replica suffix into experts_to_copy;
+      :Copy physical replica source table into experts_to_copy;
       :Create ReplicaPlan and bind it to the forward context;
 
       |ReplicaExpertRuntime|
@@ -52,7 +55,7 @@ if (MoEScheduler configured?) then (yes)
       :prepare_plan(placement) or reuse private scheduling metadata;
       :Prepare owner source weights;
 
-      |PeerTmaTransport / weight stream|
+      |ReplicaWeightTransport / weight stream|
       :start_weight_sync(...);
       :Launch asynchronous owner-to-replica weight copy;
       note right
@@ -140,7 +143,7 @@ endif
 if (Backward is executed for the planned forward?) then (yes)
   |ReplicaExpertRuntime / backward|
   :after_token_combine hook calls start_backward_prefetch(plan);
-  |PeerTmaTransport / weight stream|
+  |ReplicaWeightTransport / weight stream|
   :Launch asynchronous backward-direction weight copy;
 
   |MoELayer / backward caller stream|
@@ -185,5 +188,17 @@ else (no)
 endif
 
 |MoELayer|
+|Training / optimizer boundary|
+:Finish all microbatch backwards and reductions;
+:Defer next-step parameter gathers when home exchange is pending;
+:optimizer.step();
+if (Update successful?) then (yes)
+  :scheduler.step();
+  :home_expert_dispatch.step(): snapshot updated state,
+NCCL exchange into staging, install into fixed slots;
+  :planner.step(): commit pending home and replica mapping;
+  :Refresh model weights using existing optimizer cast path;
+endif
+:Resume parameter-gather lifecycle;
 stop
 @enduml

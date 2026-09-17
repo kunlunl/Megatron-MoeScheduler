@@ -113,10 +113,10 @@ class _ReplicaWaitGradReduce(torch.autograd.Function):
 class ReplicaExpertDispatch(ExpertDispatch):
     """Materialize an ``E + R`` layout with a transport-backed replica runtime.
 
-    The public placement is rank-major and contains each rank's native slots
-    followed by its replica slots. This adapter lowers only the replica suffix
-    to the runtime's ``experts_to_copy[rank, slot]`` input. The configured
-    expert-dispatch type selects the runtime's weight transport.
+    Placement is a physical source-home table ``[EP, S]``. Source IDs encode
+    ``rank * H + slot`` and carry no logical identity. The runtime retains each
+    table through backward so replica gradients return to the same source slot.
+    The configured expert-dispatch type selects the runtime's weight transport.
     """
 
     dispatcher_name = "replica"
@@ -157,12 +157,19 @@ class ReplicaExpertDispatch(ExpertDispatch):
         )
         experts.set_replica_expert_runtime(self.runtime)
 
-    def supports(self, physical_to_logical_map: torch.Tensor, context: SchedulerContext) -> bool:
+    def assert_idle(self) -> None:
+        """Reject home mutation while any microbatch can still use the old weights."""
+        if self._forward_context is not None or any(slot.in_use for slot in self._plan_slots):
+            raise RuntimeError("Home exchange requires all replica forwards/backwards to finish.")
+
+    def supports(self, replica_expert_placement: torch.Tensor, context: SchedulerContext) -> bool:
         return (
-            physical_to_logical_map.dim() == 1
+            replica_expert_placement.dim() == 2
             and context.num_logical_experts == self.num_experts
             and context.ep_size == self.ep_size
-            and physical_to_logical_map.numel() == self.num_experts + self.num_replica_slots
+            and tuple(replica_expert_placement.shape)
+            == (self.ep_size, self.num_local_replica_slots)
+            and replica_expert_placement.dtype in (torch.int32, torch.int64)
         )
 
     def _acquire_plan_slot(self, device: torch.device) -> _ReplicaPlanSlot:
@@ -195,7 +202,7 @@ class ReplicaExpertDispatch(ExpertDispatch):
     def dispatch(
         self,
         experts: torch.nn.Module,
-        physical_to_logical_map: torch.Tensor,
+        replica_expert_placement: torch.Tensor,
         context: SchedulerContext,
     ) -> None:
         """Start asynchronous weight prefetch for the common physical layout."""
@@ -206,18 +213,17 @@ class ReplicaExpertDispatch(ExpertDispatch):
             raise RuntimeError(
                 "Replica requires the previous token combine to finish before dispatch."
             )
-        if not self.supports(physical_to_logical_map, context):
+        if not self.supports(replica_expert_placement, context):
             raise ValueError(
-                "ReplicaExpertRuntime requires a rank-major E+R placement matching its "
+                "ReplicaExpertRuntime requires a physical [EP, S] source-slot table matching its "
                 "configured replica slots."
             )
 
-        slot = self._acquire_plan_slot(physical_to_logical_map.device)
-        rank_layout = physical_to_logical_map.reshape(self.ep_size, self.num_local_runtime_experts)
-        slot.experts_to_copy.copy_(rank_layout[:, self.num_local_home_experts :])
+        slot = self._acquire_plan_slot(replica_expert_placement.device)
+        slot.experts_to_copy.copy_(replica_expert_placement)
         self._placement_version += 1
         plan = ReplicaPlan(
-            virtual_experts=physical_to_logical_map,
+            virtual_experts=None,
             experts_to_copy=slot.experts_to_copy,
             version=self._placement_version,
         )

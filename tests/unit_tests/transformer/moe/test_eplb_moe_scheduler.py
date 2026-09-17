@@ -15,6 +15,8 @@ from megatron.core.transformer.moe.moe_scheduler import (
     SchedulerContext,
 )
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 def _context(ep_rank: int = 0, *, ep_group=None) -> SchedulerContext:
     return SchedulerContext(
@@ -58,14 +60,14 @@ def test_eplb_planner_round_robins_routes_and_preserves_probability_gradients(mo
     planner = EPLBLoadPlanner(num_redundant_experts=2)
     context = _context(ep_group=object())
 
-    physical_to_logical_map, placement_result = planner.update_placement(
+    home_placement, physical_to_logical_map, placement_result = planner.update_placement(
         probs, routing_map, context
     )
     physical_routing_map, physical_probs = planner.reroute(
         probs, routing_map, placement_result, context
     )
 
-    assert physical_to_logical_map.tolist() == [0, 1, 0, 2, 3, 0]
+    assert physical_to_logical_map.tolist() == [[0], [0]]
     assert physical_routing_map.nonzero(as_tuple=False).tolist() == [[0, 0], [1, 2], [2, 5], [3, 0]]
     torch.testing.assert_close(physical_probs.sum(dim=1), torch.ones(4))
 
@@ -84,7 +86,7 @@ def test_eplb_uses_prior_ep_rank_counts_as_round_robin_offset(monkeypatch):
     planner = EPLBLoadPlanner(num_redundant_experts=2)
     context = _context(ep_rank=1, ep_group=object())
 
-    _, placement_result = planner.update_placement(probs, routing_map, context)
+    _, _, placement_result = planner.update_placement(probs, routing_map, context)
     physical_routing_map, _ = planner.reroute(probs, routing_map, placement_result, context)
 
     assert placement_result.local_expert_offsets.tolist() == [4, 0, 0, 0]

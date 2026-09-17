@@ -18,6 +18,8 @@ from megatron.core.transformer.moe.moonep_moe_scheduler import (
 from megatron.core.transformer.moe.moonep_replica_triton import HAVE_TRITON
 from megatron.core.transformer.moe.replica_expert_dispatch import ReplicaExpertDispatch
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 def _route_inputs(
     topk_ids: torch.Tensor, num_experts: int
@@ -51,14 +53,14 @@ def test_moonep_planner_emits_2x_identity_layout_for_single_ep():
     probs, routing_map, tokens_per_expert = _route_inputs(topk_ids, num_experts=4)
     context = _context(ep_size=1, ep_rank=0)
     planner = MoonEPLoadPlanner(num_redundant_experts=4)
-    physical_to_logical_map, placement_result = planner.update_placement(
+    home_placement, physical_to_logical_map, placement_result = planner.update_placement(
         probs, routing_map, context, tokens_per_expert=tokens_per_expert
     )
     physical_routing_map, physical_probs = planner.reroute(
         probs, routing_map, placement_result, context
     )
 
-    assert physical_to_logical_map.tolist() == [0, 1, 2, 3, -1, -1, -1, -1]
+    assert physical_to_logical_map.tolist() == [[-1, -1, -1, -1]]
     assert physical_routing_map.shape == (4, 8)
     assert physical_routing_map[:, :4].sum().item() == 4
     assert physical_routing_map[:, 4:].sum().item() == 0
@@ -106,7 +108,7 @@ def test_moonep_layout_is_accepted_by_unified_replica_dispatch():
     topk_ids = torch.tensor([[0], [1], [2], [3]])
     probs, routing_map, tokens_per_expert = _route_inputs(topk_ids, num_experts=4)
     context = _context(ep_size=1, ep_rank=0)
-    physical_to_logical_map, _ = MoonEPLoadPlanner(num_redundant_experts=4).update_placement(
+    _, physical_to_logical_map, _ = MoonEPLoadPlanner(num_redundant_experts=4).update_placement(
         probs, routing_map, context, tokens_per_expert=tokens_per_expert
     )
 
@@ -119,7 +121,10 @@ def test_moonep_layout_is_accepted_by_unified_replica_dispatch():
 
     dispatcher = ReplicaExpertDispatch(
         config=SimpleNamespace(
-            num_moe_experts=4, expert_model_parallel_size=1, moe_scheduler_num_idle_experts=4
+            num_moe_experts=4,
+            expert_model_parallel_size=1,
+            moe_scheduler_num_idle_experts=4,
+            moe_scheduler_expert_dispatcher_type="replica_nccl",
         ),
         pg_collection=SimpleNamespace(ep=_Group()),
     )

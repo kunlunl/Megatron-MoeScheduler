@@ -6,14 +6,14 @@ MoEScheduler is intended to run after router output is available and before the
 normal MoE token dispatcher starts.  This module only defines the shared
 contracts:
 
-* planners first update the physical-to-logical expert placement, then reroute
-  dense router output against that placement;
-* expert dispatchers materialize that layout before token dispatch;
+* planners own logical placement and lower it to physical copy/exchange requests;
+* replica dispatch starts immediately, while home dispatch stages a deferred plan;
+* rerouting always uses the currently committed placement;
 * backend-specific lowering is kept inside the concrete expert dispatcher.
 
 Concrete Echo, EPLB, UltraEP, and MoonEP planners should produce an opaque
 ``MoEPlacementResult`` between their placement and reroute phases.
-Concrete expert dispatchers should consume ``physical_to_logical_map``.
+Concrete expert dispatchers consume physical source-slot tables, never logical mappings.
 """
 
 from __future__ import annotations
@@ -24,7 +24,10 @@ from typing import Any, ClassVar, Optional
 
 import torch
 
-from megatron.core.transformer.moe.replica_weight_transport import REPLICA_EXPERT_DISPATCHER_TYPES
+from megatron.core.transformer.moe.replica_weight_transport import (
+    REPLICA_EXPERT_DISPATCHER_TYPES,
+    HomeExpertPlacement,
+)
 
 IDENTITY_BACKEND = "identity"
 ECHO_BACKEND = "echo"
@@ -48,11 +51,6 @@ def _rank0_info(message: str) -> None:
 
 def _tensor_shape(tensor: Optional[torch.Tensor]) -> Optional[tuple[int, ...]]:
     return None if tensor is None else tuple(tensor.shape)
-
-
-def _validate_1d_tensor(name: str, tensor: torch.Tensor) -> None:
-    if tensor.dim() != 1:
-        raise ValueError(f"Expected {name} to be 1D, got shape {tuple(tensor.shape)}")
 
 
 def _validate_2d_tensor(name: str, tensor: torch.Tensor) -> None:
@@ -102,17 +100,8 @@ class MoEPlacementResult:
     """
 
 
-def _validate_physical_to_logical_map(physical_to_logical_map: torch.Tensor) -> None:
-    _validate_1d_tensor("physical_to_logical_map", physical_to_logical_map)
-    if physical_to_logical_map.dtype not in (torch.int32, torch.int64):
-        raise ValueError(
-            "Expected int32 or int64 physical_to_logical_map, "
-            f"got {physical_to_logical_map.dtype}"
-        )
-
-
 def _validate_reroute_output(
-    physical_to_logical_map: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
+    num_physical_experts: int, routing_map: torch.Tensor, probs: torch.Tensor
 ) -> None:
     _validate_2d_tensor("routing_map", routing_map)
     _validate_2d_tensor("probs", probs)
@@ -123,10 +112,10 @@ def _validate_reroute_output(
             "Expected probs and routing_map to have the same shape, "
             f"got {tuple(probs.shape)} and {tuple(routing_map.shape)}"
         )
-    if physical_to_logical_map.numel() != routing_map.size(1):
+    if num_physical_experts != routing_map.size(1):
         raise ValueError(
-            "Expected physical_to_logical_map to match routing_map expert dimension, "
-            f"got {physical_to_logical_map.numel()} and {routing_map.size(1)}"
+            "Expected physical expert count to match routing_map expert dimension, "
+            f"got {num_physical_experts} and {routing_map.size(1)}"
         )
 
 
@@ -155,8 +144,13 @@ class MoELoadPlanner(torch.nn.Module, ABC):
         context: SchedulerContext,
         *,
         tokens_per_expert: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, MoEPlacementResult]:
-        """Return a physical expert layout and planner-private reroute state."""
+    ) -> tuple[Optional[HomeExpertPlacement], Optional[torch.Tensor], MoEPlacementResult]:
+        """Return optional home exchange, replica copies, and private reroute state."""
+
+    def step(self, completed_version: Optional[int] = None) -> None:
+        """Commit completed home placement after a successful optimizer update."""
+        if completed_version is not None:
+            raise RuntimeError("This planner has no pending home exchange.")
 
     @abstractmethod
     def reroute(
@@ -174,16 +168,16 @@ class ExpertDispatch(torch.nn.Module, ABC):
 
     dispatcher_name: ClassVar[str] = "abstract"
 
-    def supports(self, physical_to_logical_map: torch.Tensor, context: SchedulerContext) -> bool:
+    def supports(self, expert_placement: torch.Tensor, context: SchedulerContext) -> bool:
         """Return whether this dispatcher can materialize the given physical layout."""
-        del physical_to_logical_map, context
+        del expert_placement, context
         return True
 
     @abstractmethod
     def dispatch(
         self,
         experts: torch.nn.Module,
-        physical_to_logical_map: torch.Tensor,
+        expert_placement: torch.Tensor,
         context: SchedulerContext,
     ) -> None:
         """Materialize the planned expert placement before token dispatch begins."""
@@ -191,6 +185,9 @@ class ExpertDispatch(torch.nn.Module, ABC):
     def finalize(self, context: SchedulerContext) -> None:
         """Release transient dispatch state after the MoE forward finishes."""
         del context
+
+    def assert_idle(self) -> None:
+        """Check that no outstanding dispatch can consume home state being migrated."""
 
     def bind_experts(self, experts: torch.nn.Module) -> None:
         """Bind expert parameters for dispatchers that own persistent runtime weights."""
@@ -223,10 +220,16 @@ class MoEScheduler(torch.nn.Module):
     _logged_config_signatures: ClassVar[set[tuple[str, str, int, str]]] = set()
     _logged_runtime_summary: ClassVar[bool] = False
 
-    def __init__(self, planner: MoELoadPlanner, expert_dispatch: ExpertDispatch) -> None:
+    def __init__(
+        self,
+        planner: MoELoadPlanner,
+        expert_dispatch: ExpertDispatch,
+        home_expert_dispatch: Optional[ExpertDispatch] = None,
+    ) -> None:
         super().__init__()
         self.planner = planner
         self.expert_dispatch = expert_dispatch
+        self.home_expert_dispatch = home_expert_dispatch
 
     @classmethod
     def from_config(cls, config: Any, pg_collection: Any) -> "MoEScheduler":
@@ -257,7 +260,10 @@ class MoEScheduler(torch.nn.Module):
         elif planner_type == "eplb":
             from megatron.core.transformer.moe.eplb_moe_scheduler import EPLBLoadPlanner
 
-            planner = EPLBLoadPlanner(num_redundant_experts=num_idle_experts)
+            planner = EPLBLoadPlanner(
+                num_redundant_experts=num_idle_experts,
+                home_update_interval=getattr(config, "moe_scheduler_home_update_interval", 0),
+            )
         else:
             from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner
 
@@ -279,11 +285,37 @@ class MoEScheduler(torch.nn.Module):
                 f"num_idle_experts={num_idle_experts} "
                 f"assignment_algorithm={assignment_algorithm}"
             )
-        return cls(planner=planner, expert_dispatch=expert_dispatch)
+        home_dispatch = None
+        if getattr(config, "moe_scheduler_home_update_interval", 0):
+            from megatron.core.transformer.moe.home_expert_dispatch import HomeExpertDispatch
+
+            home_dispatch = HomeExpertDispatch()
+        return cls(
+            planner=planner, expert_dispatch=expert_dispatch, home_expert_dispatch=home_dispatch
+        )
 
     def bind_experts(self, experts: torch.nn.Module) -> None:
         """Bind the layer's native experts to the configured dispatch backend."""
         self.expert_dispatch.bind_experts(experts)
+        if self.home_expert_dispatch is not None:
+            self.home_expert_dispatch.bind_transport(self.expert_dispatch.runtime.transport)
+
+    def bind_optimizer(self, optimizer) -> None:
+        """Bind authoritative state after DDP/FSDP and optimizer construction."""
+        if self.home_expert_dispatch is not None:
+            from megatron.core.transformer.moe.home_expert_state import OptimizerHomeExpertState
+
+            self.home_expert_dispatch.bind_state_adapter(
+                OptimizerHomeExpertState(optimizer, self.expert_dispatch.runtime)
+            )
+
+    def step(self) -> None:
+        """Migrate updated home state, then publish mapping, at a drained step boundary."""
+        version = None
+        if self.home_expert_dispatch is not None:
+            self.expert_dispatch.assert_idle()
+            version = self.home_expert_dispatch.step()
+        self.planner.step(version)
 
     def wrap_layer_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Attach dispatcher work before routing and shared-expert computation."""
@@ -292,7 +324,7 @@ class MoEScheduler(torch.nn.Module):
     def _log_first_schedule(
         self,
         input_routing_map: torch.Tensor,
-        physical_to_logical_map: Optional[torch.Tensor],
+        num_physical_experts: Optional[int],
         output_routing_map: Optional[torch.Tensor],
         context: SchedulerContext,
         *,
@@ -302,7 +334,7 @@ class MoEScheduler(torch.nn.Module):
         if MoEScheduler._logged_runtime_summary:
             return
         MoEScheduler._logged_runtime_summary = True
-        if physical_to_logical_map is None:
+        if num_physical_experts is None:
             output_routing_map = input_routing_map
             expert_backend = IDENTITY_BACKEND
             num_physical_experts = context.num_logical_experts
@@ -312,7 +344,6 @@ class MoEScheduler(torch.nn.Module):
         else:
             assert output_routing_map is not None
             expert_backend = self.expert_dispatch.dispatcher_name
-            num_physical_experts = physical_to_logical_map.numel()
             num_transfers = max(0, num_physical_experts - context.num_logical_experts)
             assignment_backend = self.planner.planner_name
             reroute_backend = "planner"
@@ -351,30 +382,41 @@ class MoEScheduler(torch.nn.Module):
             )
             return probs, routing_map
 
-        physical_to_logical_map, placement_result = self.planner.update_placement(
-            probs, routing_map, context, tokens_per_expert=tokens_per_expert
-        )
-        _validate_physical_to_logical_map(physical_to_logical_map)
-        if not self.expert_dispatch.supports(physical_to_logical_map, context):
-            raise ValueError(
-                f"Expert dispatcher {self.expert_dispatch.dispatcher_name!r} "
-                "does not support planner output physical_to_logical_map."
+        home_expert_placement, replica_expert_placement, placement_result = (
+            self.planner.update_placement(
+                probs, routing_map, context, tokens_per_expert=tokens_per_expert
             )
-
-        # Dispatch starts asynchronous expert-weight communication. Rerouting
-        # remains on the caller's stream and can overlap that communication.
-        self.expert_dispatch.dispatch(experts, physical_to_logical_map, context)
+        )
+        if home_expert_placement is not None:
+            if self.home_expert_dispatch is None:
+                raise ValueError("Planner requested home exchange without HomeExpertDispatch.")
+            self.home_expert_dispatch.dispatch(experts, home_expert_placement, context)
+        if replica_expert_placement is not None:
+            if (
+                replica_expert_placement.ndim != 2
+                or replica_expert_placement.shape[0] != context.ep_size
+                or replica_expert_placement.dtype not in (torch.int32, torch.int64)
+            ):
+                raise ValueError("Expected integer replica placement [EP, S].")
+            if not self.expert_dispatch.supports(replica_expert_placement, context):
+                raise ValueError(
+                    "Expert dispatcher does not support planner output replica source-slot table."
+                )
+            self.expert_dispatch.dispatch(experts, replica_expert_placement, context)
         rerouted_routing_map, rerouted_probs = self.planner.reroute(
             probs, routing_map, placement_result, context
         )
-        _validate_reroute_output(physical_to_logical_map, rerouted_routing_map, rerouted_probs)
+        num_physical_experts = context.num_logical_experts + (
+            replica_expert_placement.numel() if replica_expert_placement is not None else 0
+        )
+        _validate_reroute_output(num_physical_experts, rerouted_routing_map, rerouted_probs)
         self._log_first_schedule(
             routing_map,
-            physical_to_logical_map,
+            num_physical_experts,
             rerouted_routing_map,
             context,
             planning_skipped=False,
-            dispatch_materialized=True,
+            dispatch_materialized=replica_expert_placement is not None,
         )
         return rerouted_probs, rerouted_routing_map
 

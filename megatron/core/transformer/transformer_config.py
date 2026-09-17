@@ -965,6 +965,9 @@ class TransformerConfig(ModelParallelConfig):
     this to equal ``num_moe_experts``.
     """
 
+    moe_scheduler_home_update_interval: int = 0
+    """Successful optimizer steps between EPLB home proposals; zero keeps homes fixed."""
+
     moe_scheduler_assignment_algorithm: Literal['one_shot_greedy', 'approx_bin_packing'] = (
         "approx_bin_packing"
     )
@@ -2099,6 +2102,14 @@ class TransformerConfig(ModelParallelConfig):
                     "Unsupported moe_scheduler_expert_dispatcher_type; expected one of "
                     f"{REPLICA_EXPERT_DISPATCHER_TYPES}."
                 )
+            if self.moe_scheduler_home_update_interval < 0:
+                raise ValueError("moe_scheduler_home_update_interval must be non-negative.")
+            if self.moe_scheduler_home_update_interval:
+                if self.moe_scheduler_planner_type != "eplb":
+                    raise ValueError("Periodic home exchange requires the EPLB planner.")
+                if self.moe_scheduler_expert_dispatcher_type != "replica_nccl":
+                    raise ValueError("Home exchange currently requires NCCL; Peer-TMA is reserved.")
+
             if self.moe_scheduler_num_idle_experts is None:
                 raise ValueError(
                     "moe_scheduler_num_idle_experts must be set when MoEScheduler is enabled."

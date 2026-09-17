@@ -1797,7 +1797,11 @@ class ChainedOptimizer(MegatronOptimizer):
         for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
             self._before_child_step(optimizer_idx)
             success &= optimizer.step_with_ready_grads()
-            if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:
+            if (
+                self.config.overlap_param_gather_with_optimizer_step
+                and optimizer_idx == 0
+                and not getattr(optimizer, "_home_exchange_defer_param_sync", False)
+            ):
                 assert success
                 assert len(optimizer.model_chunks) == 1
                 optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
@@ -1889,7 +1893,14 @@ class ChainedOptimizer(MegatronOptimizer):
         finally:
             self._disable_deferred_mxfp8_param_sync()
 
-        if success and deferred_bucket_groups:
+        if (
+            success
+            and deferred_bucket_groups
+            and not any(
+                getattr(opt, "_home_exchange_defer_param_sync", False)
+                for opt in self.chained_optimizers
+            )
+        ):
             self._start_deferred_mxfp8_param_sync(deferred_bucket_groups)
 
         return success

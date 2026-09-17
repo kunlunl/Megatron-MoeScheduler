@@ -48,9 +48,9 @@ class ReplicaPlan:
     """Transport-facing result of replica placement planning.
 
     Attributes:
-        virtual_experts: Rank-major physical-slot-to-logical-expert map,
-            with shape ``[num_experts + num_replica_slots]``.
-        experts_to_copy: Semantic expert ids assigned to each rank's replica
+        virtual_experts: Optional private MoonEP helper result. Runtime dispatch
+            leaves this None and never interprets logical expert identities.
+        experts_to_copy: Physical source-home slots assigned to each rank's replica
             slots, with shape ``[ep_size, num_replica_slots_per_gpu]``. Unused
             slots contain ``-1``.
         version: Dispatcher-local generation, incremented on every placement.
@@ -60,7 +60,7 @@ class ReplicaPlan:
     through the forward/backward lifetime, including CUDA graph replay.
     """
 
-    virtual_experts: torch.Tensor
+    virtual_experts: torch.Tensor | None
     experts_to_copy: torch.Tensor
     version: int = 0
 

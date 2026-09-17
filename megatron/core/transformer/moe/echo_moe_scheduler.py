@@ -1148,7 +1148,7 @@ class EchoLoadPlanner(MoELoadPlanner):
         context: SchedulerContext,
         *,
         tokens_per_expert: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, EchoPlacementResult]:
+    ) -> tuple[None, torch.Tensor, EchoPlacementResult]:
         """Return the Echo physical layout and its explicit assignment state."""
         if routing_map.size(1) != context.num_logical_experts:
             raise ValueError(
@@ -1175,24 +1175,36 @@ class EchoLoadPlanner(MoELoadPlanner):
                 self.num_echo_experts,
                 self._resolved_assignment_algorithm(context),
             )
-            return physical_to_logical_map, EchoPlacementResult(
-                expert_offloading_map=expert_offloading_map,
-                local_echo_counts=local_echo_counts,
-                local_home_counts=local_home_counts,
+            return (
+                None,
+                physical_to_logical_map.reshape(context.ep_size, -1)[
+                    :, context.num_local_experts :
+                ].contiguous(),
+                EchoPlacementResult(
+                    expert_offloading_map=expert_offloading_map,
+                    local_echo_counts=local_echo_counts,
+                    local_home_counts=local_home_counts,
+                ),
             )
 
         assignment = self._compute_assignment(
             routing_map, context, tokens_per_expert=counts_from_ep_rank[context.ep_rank]
         )
         physical_to_logical_map = self._build_physical_to_logical_map(assignment, context)
-        return physical_to_logical_map, EchoPlacementResult(
-            expert_offloading_map=assignment.expert_offloading_map,
-            local_echo_counts=assignment.count_tokens_offloaded_from_ep_rank_to_echo[
-                context.ep_rank
-            ],
-            local_home_counts=assignment.count_tokens_offloaded_from_ep_rank_from_home_expert[
-                context.ep_rank
-            ],
+        return (
+            None,
+            physical_to_logical_map.reshape(context.ep_size, -1)[
+                :, context.num_local_experts :
+            ].contiguous(),
+            EchoPlacementResult(
+                expert_offloading_map=assignment.expert_offloading_map,
+                local_echo_counts=assignment.count_tokens_offloaded_from_ep_rank_to_echo[
+                    context.ep_rank
+                ],
+                local_home_counts=assignment.count_tokens_offloaded_from_ep_rank_from_home_expert[
+                    context.ep_rank
+                ],
+            ),
         )
 
     def reroute(

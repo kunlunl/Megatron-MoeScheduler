@@ -209,7 +209,9 @@ def test_runtime_gradient_handoff_keeps_fc2_first_and_reuses_the_backward_plan()
 
 def test_joint_transport_defers_fc2_until_both_projection_gradients_are_ready():
     runtime = _runtime()
-    runtime.transport.capabilities = replace(runtime.transport.capabilities, split_grad_reduce=False)
+    runtime.transport.capabilities = replace(
+        runtime.transport.capabilities, split_grad_reduce=False
+    )
     plan = _plan()
     runtime.projections = tuple(
         SimpleNamespace(native_grad=torch.ones(2, 4, 4), native_grad_bases=None, gtp_leader=None)
@@ -285,3 +287,30 @@ def test_finalize_only_visits_initialized_backends(monkeypatch):
     transport_module.finalize_replica_weight_transports()
     transport_module.finalize_replica_weight_transports()
     assert calls == ["test"]
+
+
+def test_ultraep_destroy_drains_operations_before_releasing_native_staging():
+    from megatron.core.transformer.moe.replica_ultraep_transport import UltraEPTransport
+
+    transport = object.__new__(UltraEPTransport)
+    transport._destroyed = False
+    transport._native_grads = (torch.ones(2, 4, 4), torch.ones(2, 4, 4))
+    storage_refs = [weakref.ref(tensor) for tensor in transport._native_grads]
+    transport._sources = (object(),)
+    transport._fence = torch.zeros(1)
+    drained = []
+
+    def synchronize():
+        assert all(ref() is not None for ref in storage_refs)
+        drained.append(True)
+
+    manager = object()
+    transport.manager = manager
+    transport._stream = SimpleNamespace(synchronize=synchronize)
+    transport.destroy()
+    gc.collect()
+    assert drained == [True]
+    assert all(ref() is None for ref in storage_refs)
+    assert transport.manager is manager  # native NVSHMEM cleanup stays collective
+    transport.destroy()
+    assert drained == [True]

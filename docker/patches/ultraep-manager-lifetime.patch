@@ -1,0 +1,62 @@
+diff --git a/csrc/ultra_ep.cpp b/csrc/ultra_ep.cpp
+index 0c9e2d2..521fa65 100644
+--- a/csrc/ultra_ep.cpp
++++ b/csrc/ultra_ep.cpp
+@@ -8,6 +8,10 @@ namespace ultra_ep {
+
+ namespace {
+
++// Managers own separate buffers but share one process-wide NVSHMEM runtime.
++// Construction/destruction are collective and serialized by the Python GIL.
++int active_manager_count = 0;
++
+ int64_t checked_num_bytes(const int64_t numel, const int elem_bytes) {
+     EP_HOST_ASSERT(numel >= 0);
+     EP_HOST_ASSERT(elem_bytes > 0);
+@@ -529,6 +533,7 @@ Manager::Manager(const int& num_layers,
+     CUDA_RUNTIME_CHECK(cudaStreamSynchronize(at::cuda::getCurrentCUDAStream().stream()));
+
+     // Ready to use (no IPC handle exchange needed with NVSHMEM)
++    ++active_manager_count;
+     _available = true;
+ }
+
+@@ -640,8 +645,10 @@ void Manager::destroy() {
+     // Free contiguous placement buffers (CPU pinned + GPU)
+     placement.cleanup();
+
+-    // Free NVSHMEM runtime
+-    runtime::destroy();
++    // Other managers still need NVSHMEM to use and free their own buffers.
++    EP_HOST_ASSERT(active_manager_count > 0);
++    if (--active_manager_count == 0)
++        runtime::destroy();
+
+     // Ready to destroy
+     _available = false;
+diff --git a/csrc/ultra_ep.hpp b/csrc/ultra_ep.hpp
+index 2583676..e3927bc 100644
+--- a/csrc/ultra_ep.hpp
++++ b/csrc/ultra_ep.hpp
+@@ -337,6 +337,7 @@ public:
+ };
+
+ static void register_apis(pybind11::module_& m) {
++    m.attr("supports_multi_manager") = pybind11::bool_(true);
+     pybind11::class_<Manager>(m, "Manager")
+         .def(pybind11::init<int,
+                             int,
+diff --git a/ultra_ep/manager.py b/ultra_ep/manager.py
+index a4ec404..1df35b1 100644
+--- a/ultra_ep/manager.py
++++ b/ultra_ep/manager.py
+@@ -16,6 +16,9 @@ from .util import (
+
+
+ class Manager:
++    # Native destroy keeps NVSHMEM alive until the final manager releases it.
++    supports_multi_manager = getattr(_C, "supports_multi_manager", False)
++
+     def __init__(
+         self,
+         group: dist.ProcessGroup,

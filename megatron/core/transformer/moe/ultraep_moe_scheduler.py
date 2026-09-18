@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -22,7 +22,7 @@ from megatron.core.transformer.moe.ultraep_backend import create_ultraep_manager
 class UltraEPPlacementResult(MoEPlacementResult):
     """Snapshot of placement plus the owner of the pending quota reroute."""
 
-    manager: object
+    manager: Any
     physical_to_logical_map: torch.Tensor
 
 
@@ -69,7 +69,10 @@ class UltraEPLoadPlanner(MoELoadPlanner):
     planner_name = "ultra_ep"
 
     def __init__(
-        self, num_redundant_experts: int, group, manager_provider: Callable | None = None
+        self,
+        num_redundant_experts: int,
+        group: dist.ProcessGroup,
+        manager_provider: Callable[[], Any] | None = None,
     ) -> None:
         super().__init__()
         self.num_redundant_experts = num_redundant_experts
@@ -78,7 +81,7 @@ class UltraEPLoadPlanner(MoELoadPlanner):
         self._manager = None
         self._pending: UltraEPPlacementResult | None = None
 
-    def _get_manager(self, context: SchedulerContext):
+    def _get_manager(self, context: SchedulerContext) -> Any:
         if self._manager is None:
             if self._manager_provider is not None:
                 self._manager = self._manager_provider()

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -115,6 +116,9 @@ class UltraEPTransport(ReplicaWeightTransport):
             grad_dtype=torch.float32,
             is_train=True,
         )
+        # UltraEP's native stream_wait rejects a caller on its own comm stream.
+        # Keep the EP fences and completion join on a separate orchestration stream.
+        self._stream = torch.cuda.Stream(device=config.device)
         self._native_grads = tuple(
             torch.empty(
                 (config.num_local_home_experts, *shape), dtype=torch.float32, device=config.device
@@ -165,7 +169,11 @@ class UltraEPTransport(ReplicaWeightTransport):
         if torch.cuda.is_current_stream_capturing():
             raise ValueError("replica_ultraep does not support MoE CUDA graph capture.")
 
-    def _register(self, sources, native_grads) -> tuple[torch.Tensor, ...]:
+    def _register(
+        self,
+        sources: tuple[ReplicaWeightSource, ...],
+        native_grads: tuple[ReplicaGradDestination, ...],
+    ) -> tuple[torch.Tensor, ...]:
         if len(sources) != 2 or len(native_grads) != 2:
             raise ValueError("UltraEP requires both FC1 and FC2 sources and destinations.")
         for index, (source, destination) in enumerate(zip(sources, native_grads)):
@@ -199,11 +207,16 @@ class UltraEPTransport(ReplicaWeightTransport):
             for component in ("weight", "weight_scale", "grad")
         )
 
-    def _start(self, operation, plan, tensors) -> ReplicaTransferHandle:
+    def _start(
+        self,
+        operation: Callable[..., Any],
+        plan: ReplicaPreparedPlan,
+        tensors: tuple[torch.Tensor, ...],
+    ) -> ReplicaTransferHandle:
         self._check_execution()
         self.validate_plan(plan)
         caller = torch.cuda.current_stream(self.config.device)
-        stream = self.manager.get_comm_stream()
+        stream = self._stream
         stream.wait_stream(caller)
         keepalive = (*tensors, *plan.metadata.values())
         with torch.cuda.stream(stream):
@@ -267,6 +280,11 @@ class UltraEPTransport(ReplicaWeightTransport):
         self._wait(handle)
 
     def destroy(self) -> None:
-        # Collective manager cleanup is deferred to the common finalizer.
-        self._destroyed = True
+        """Drain operations and release layer-owned staging; defer NVSHMEM cleanup."""
+        if self._destroyed:
+            return
+        self._stream.synchronize()
         self._sources = None
+        self._native_grads = ()
+        self._fence = None
+        self._destroyed = True

@@ -3244,7 +3244,9 @@ class TransformerConfig(ModelParallelConfig):
             )
         ):
             if self.moe_scheduler_expert_dispatcher_type == "replica_nccl":
-                raise ValueError("replica_nccl host schedules do not support MoE CUDA graph capture.")
+                raise ValueError(
+                    "replica_nccl host schedules do not support MoE CUDA graph capture."
+                )
             raise ValueError("UltraEP integration does not support MoE CUDA graph capture.")
         assert all(
             isinstance(scope, CudaGraphModule) for scope in self.cuda_graph_modules

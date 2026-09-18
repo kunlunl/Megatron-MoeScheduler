@@ -839,7 +839,9 @@ class ReplicaExpertRuntime:
         if self._grad_reduce_plan is not None and self._grad_reduce_plan is not plan:
             raise RuntimeError("Replica gradient reduction is outstanding for another plan.")
         if self._grad_reduce_started.intersection(projections):
-            raise RuntimeError(f"Replica gradient reduction of projections {projections} started twice.")
+            raise RuntimeError(
+                f"Replica gradient reduction of projections {projections} started twice."
+            )
         self._validate_plan(plan)
         handle = self.transport.start_grad_reduce(
             native_grads=tuple(

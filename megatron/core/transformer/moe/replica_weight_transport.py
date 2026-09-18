@@ -13,7 +13,10 @@ import torch
 import torch.distributed as dist
 
 REPLICA_EXPERT_DISPATCHER_TYPES = (
-    "replica_peer_tma", "replica_hybridep", "replica_nccl", "replica_ultraep"
+    "replica_peer_tma",
+    "replica_hybridep",
+    "replica_nccl",
+    "replica_ultraep",
 )
 
 

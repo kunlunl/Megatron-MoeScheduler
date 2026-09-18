@@ -236,7 +236,7 @@ class MoEScheduler(torch.nn.Module):
         """Build the configured MoEScheduler backend stack."""
         planner_type = getattr(config, "moe_scheduler_planner_type", None)
         expert_dispatcher_type = getattr(config, "moe_scheduler_expert_dispatcher_type", None)
-        if planner_type not in ("echo", "eplb", "moon_ep"):
+        if planner_type not in ("echo", "eplb", "moon_ep", "ultra_ep"):
             raise ValueError(f"Unsupported MoEScheduler planner: {planner_type}")
         if expert_dispatcher_type not in REPLICA_EXPERT_DISPATCHER_TYPES:
             raise ValueError(
@@ -255,6 +255,7 @@ class MoEScheduler(torch.nn.Module):
         from megatron.core.transformer.moe.echo_moe_scheduler import EchoLoadPlanner
         from megatron.core.transformer.moe.replica_expert_dispatch import ReplicaExpertDispatch
 
+        expert_dispatch = ReplicaExpertDispatch(config=config, pg_collection=pg_collection)
         if planner_type == "echo":
             planner = EchoLoadPlanner(num_idle_experts, assignment_algorithm=assignment_algorithm)
         elif planner_type == "eplb":
@@ -264,12 +265,22 @@ class MoEScheduler(torch.nn.Module):
                 num_redundant_experts=num_idle_experts,
                 home_update_interval=getattr(config, "moe_scheduler_home_update_interval", 0),
             )
+        elif planner_type == "ultra_ep":
+            from megatron.core.transformer.moe.ultraep_moe_scheduler import UltraEPLoadPlanner
+
+            # Share the per-layer Manager when both components use UltraEP.
+            # Other transports leave planner communication storage minimal.
+            manager_provider = (
+                (lambda: expert_dispatch.runtime.transport.manager)
+                if expert_dispatcher_type == "replica_ultraep"
+                else None
+            )
+            planner = UltraEPLoadPlanner(num_idle_experts, pg_collection.ep, manager_provider)
         else:
             from megatron.core.transformer.moe.moonep_moe_scheduler import MoonEPLoadPlanner
 
             ep_size = getattr(config, "expert_model_parallel_size", 1)
             planner = MoonEPLoadPlanner(num_redundant_experts=num_idle_experts // ep_size)
-        expert_dispatch = ReplicaExpertDispatch(config=config, pg_collection=pg_collection)
         config_signature = (
             str(planner_type),
             str(expert_dispatcher_type),

@@ -833,14 +833,15 @@ class ReplicaExpertRuntime:
         self.start_prefetch(plan, _WeightDirection.BACKWARD)
 
     @torch.no_grad()
-    def start_grad_reduce(self, plan: ReplicaPlan, projection: int) -> None:
-        """Enqueue one projection's replica-gradient reduction."""
+    def start_grad_reduce(self, plan: ReplicaPlan, projection: int | None) -> None:
+        """Enqueue one projection, or both together for a joint-reduction transport."""
+        projections = (0, 1) if projection is None else (projection,)
         if self._grad_reduce_plan is not None and self._grad_reduce_plan is not plan:
             raise RuntimeError("Replica gradient reduction is outstanding for another plan.")
-        if projection in self._grad_reduce_started:
-            raise RuntimeError(f"Replica gradient reduction of FC{projection + 1} started twice.")
+        if self._grad_reduce_started.intersection(projections):
+            raise RuntimeError(f"Replica gradient reduction of projections {projections} started twice.")
         self._validate_plan(plan)
-        self._grad_reduce_handles[projection] = self.transport.start_grad_reduce(
+        handle = self.transport.start_grad_reduce(
             native_grads=tuple(
                 ReplicaGradDestination(
                     tensors=tuple(projection.native_grad), bases=projection.native_grad_bases
@@ -848,21 +849,29 @@ class ReplicaExpertRuntime:
                 for projection in self.projections
             ),
             plan=self._prepare_transport_plan(plan),
-            projections=(projection,),
+            projections=projections,
         )
+        for index in projections:
+            self._grad_reduce_handles[index] = handle
         self._grad_reduce_plan = plan
-        self._grad_reduce_started.add(projection)
+        self._grad_reduce_started.update(projections)
 
     def start_fc2_grad_reduce(self) -> None:
         """Start FC2 reduction immediately behind its wgrad GEMM."""
         if self._backward_plan is None:
             raise RuntimeError("Replica FC2 gradient reduction needs the backward plan.")
+        if not self.transport.capabilities.split_grad_reduce:
+            return
         self.start_grad_reduce(self._backward_plan, 1)
 
     def start_pending_grad_reduces(self, plan: ReplicaPlan) -> None:
         """Start reductions not already issued by expert backward, FC2 first."""
         if self._grad_reduce_plan is not None and self._grad_reduce_plan is not plan:
             raise RuntimeError("Replica gradient reduction is outstanding for another plan.")
+        if not self.transport.capabilities.split_grad_reduce:
+            if not self._grad_reduce_started:
+                self.start_grad_reduce(plan, None)
+            return
         for projection in (1, 0):
             if projection not in self._grad_reduce_started:
                 self.start_grad_reduce(plan, projection)

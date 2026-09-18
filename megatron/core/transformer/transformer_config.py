@@ -943,17 +943,18 @@ class TransformerConfig(ModelParallelConfig):
     expert replicas before the existing token dispatcher runs. The MoE forward/backward flow
     remains the same after scheduler preprocessing."""
 
-    moe_scheduler_planner_type: Literal['echo', 'eplb', 'moon_ep'] = "echo"
-    """Planner backend used by MoEScheduler. Supports 'echo', 'eplb', and 'moon_ep'."""
+    moe_scheduler_planner_type: Literal['echo', 'eplb', 'moon_ep', 'ultra_ep'] = "echo"
+    """Planner backend: 'echo', 'eplb', 'moon_ep', or UltraEP PR #2's 'ultra_ep'."""
 
     moe_scheduler_expert_dispatcher_type: Literal[
-        'replica_peer_tma', 'replica_hybridep', 'replica_nccl'
+        'replica_peer_tma', 'replica_hybridep', 'replica_nccl', 'replica_ultraep'
     ] = "replica_peer_tma"
     """Expert-dispatch backend used by MoEScheduler.
 
     The single replica expert dispatcher uses this value to select its weight transport.
     ``replica_peer_tma`` selects the existing symmetric-memory peer-TMA transport.
     ``replica_nccl`` selects packed NCCL P2P for BF16/MXFP8 weights with host planning.
+    ``replica_ultraep`` selects UltraEP PR #2 with BF16 weights and FP32 joint gradients.
     ``replica_hybridep`` is a reserved, unimplemented transport.
     Existing configs using the old ``replica_hybridep`` name must use ``replica_peer_tma``.
     """
@@ -2092,9 +2093,9 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "MoEScheduler expert dispatch currently requires add_bias_linear=False."
                 )
-            if self.moe_scheduler_planner_type not in ("echo", "eplb", "moon_ep"):
+            if self.moe_scheduler_planner_type not in ("echo", "eplb", "moon_ep", "ultra_ep"):
                 raise ValueError(
-                    "Only moe_scheduler_planner_type='echo', 'eplb', and 'moon_ep' are "
+                    "Only moe_scheduler_planner_type='echo', 'eplb', 'moon_ep', and 'ultra_ep' are "
                     "currently implemented."
                 )
             if self.moe_scheduler_expert_dispatcher_type not in REPLICA_EXPERT_DISPATCHER_TYPES:
@@ -2104,6 +2105,9 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if self.moe_scheduler_home_update_interval < 0:
                 raise ValueError("moe_scheduler_home_update_interval must be non-negative.")
+            if self.moe_scheduler_expert_dispatcher_type == "replica_ultraep":
+                if self.fp8 or self.fp4 or self.grad_reduce_in_bf16:
+                    raise ValueError("replica_ultraep requires BF16 weights and FP32 gradients.")
             if self.moe_scheduler_home_update_interval:
                 if self.moe_scheduler_planner_type != "eplb":
                     raise ValueError("Periodic home exchange requires the EPLB planner.")
@@ -3227,7 +3231,10 @@ class TransformerConfig(ModelParallelConfig):
         self.cuda_graph_modules = normalized_scopes
         if (
             self.moe_enable_scheduler
-            and self.moe_scheduler_expert_dispatcher_type == "replica_nccl"
+            and (
+                self.moe_scheduler_expert_dispatcher_type in ("replica_nccl", "replica_ultraep")
+                or self.moe_scheduler_planner_type == "ultra_ep"
+            )
             and self.cuda_graph_impl != "none"
             and (
                 self.cuda_graph_impl == "full_iteration"
@@ -3236,7 +3243,9 @@ class TransformerConfig(ModelParallelConfig):
                 & set(self.cuda_graph_modules)
             )
         ):
-            raise ValueError("replica_nccl host schedules do not support MoE CUDA graph capture.")
+            if self.moe_scheduler_expert_dispatcher_type == "replica_nccl":
+                raise ValueError("replica_nccl host schedules do not support MoE CUDA graph capture.")
+            raise ValueError("UltraEP integration does not support MoE CUDA graph capture.")
         assert all(
             isinstance(scope, CudaGraphModule) for scope in self.cuda_graph_modules
         ), f"cuda_graph_modules must be a list of CudaGraphModule, got {self.cuda_graph_modules}."

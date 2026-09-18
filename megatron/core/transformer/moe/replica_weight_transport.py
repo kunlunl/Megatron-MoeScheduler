@@ -12,7 +12,9 @@ from typing import Any, Callable, NoReturn
 import torch
 import torch.distributed as dist
 
-REPLICA_EXPERT_DISPATCHER_TYPES = ("replica_peer_tma", "replica_hybridep", "replica_nccl")
+REPLICA_EXPERT_DISPATCHER_TYPES = (
+    "replica_peer_tma", "replica_hybridep", "replica_nccl", "replica_ultraep"
+)
 
 
 class ReplicaWeightLayout(Enum):
@@ -125,6 +127,8 @@ class ReplicaTransportCapabilities:
     cuda_graph: bool = False
     explicit_ownership: bool = False
     home_exchange: bool = False
+    split_grad_reduce: bool = True
+    """Whether FC2 reduction may start before FC1 wgrad is ready."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,6 +364,10 @@ def create_replica_weight_transport(
         from megatron.core.transformer.moe.replica_nccl_transport import NcclP2PTransport
 
         return NcclP2PTransport(config)
+    if expert_dispatcher_type == "replica_ultraep":
+        from megatron.core.transformer.moe.replica_ultraep_transport import UltraEPTransport
+
+        return UltraEPTransport(config)
     raise ValueError(
         "Unsupported replica expert-dispatch transport: " f"{expert_dispatcher_type!r}."
     )

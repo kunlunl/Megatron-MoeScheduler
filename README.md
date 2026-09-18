@@ -213,13 +213,15 @@ The same architecture is available as standalone PlantUML sources:
 | Planner | `echo` | `EchoLoadPlanner` | CUDA/Triton assignment and token reroute aligned with Echo PR #2368. |
 | Planner | `eplb` | `EPLBLoadPlanner` | Greedy replication, optional periodic home LPT permutations, and global round-robin rerouting. |
 | Planner | `moon_ep` | `MoonEPLoadPlanner` | PR #6892 fused per-step placement: one cooperative kernel with symmetric-memory histogram exchange. |
+| Planner | `ultra_ep` | `UltraEPLoadPlanner` | PR #2 quota forward with saved routing for backward; fixed homes. |
 | Expert dispatch | `replica_peer_tma` | `ReplicaExpertDispatch` | One replica lifecycle implementation; the type currently selects `PeerTmaTransport`. |
 | Expert dispatch | `replica_hybridep` | Same dispatcher, `HybridEPWeightTransport` | Placeholder; raises `NotImplementedError` before transport allocation. |
 | Expert dispatch | `replica_nccl` | Same dispatcher, `NcclP2PTransport` | Packed NCCL P2P; BF16/MXFP8 weights, BF16/FP32 gradients, host planning. |
+| Expert dispatch | `replica_ultraep` | Same dispatcher, `UltraEPTransport` | PR #2 explicit placement; BF16 weights, FP32 joint gradients, host validation and EP fences. |
 
-UltraEP is a planned integration. It should implement the same common planner
-output or expert-dispatch input semantics instead of exposing UltraEP-native
-metadata in the public interface.
+UltraEP PR #2 is available through the experimental `ultra_ep` planner and
+`replica_ultraep` weight transport. See [UltraEP integration](#ultraep-integration-pr-2)
+for the pinned API, first-version limits and validation commands.
 
 ## Execution Flow
 
@@ -514,6 +516,84 @@ python -m torch.distributed.run --nproc-per-node 8 -m pytest \
   tests/unit_tests/transformer/moe/test_eplb_moe_scheduler.py \
   tests/unit_tests/transformer/moe/test_moonep_moe_scheduler.py
 ```
+
+## UltraEP Integration (PR #2)
+
+This integration targets [UltraEP PR #2](https://github.com/Dots-Infra/UltraEP/pull/2),
+head `6f27b25e7f03f4166c3721dffcf01d1051b1206a` in `xinming-wei/UltraEP`.
+The PR was still open on 2026-09-17; verify the final merged revision before
+updating the dependency. Build that revision and its NVSHMEM dependency **inside
+the development container**, following the upstream installation instructions.
+UltraEP is imported only when selected; other backends do not require it.
+
+On top of a working BF16/TE-fuser/HybridEP-token scheduler configuration, select:
+
+```yaml
+moe_enable_scheduler: true
+moe_scheduler_planner_type: ultra_ep
+moe_scheduler_expert_dispatcher_type: replica_ultraep
+moe_scheduler_num_idle_experts: 4  # global count; divisible by EP size
+moe_scheduler_home_update_interval: 0
+grad_reduce_in_bf16: false
+```
+
+The integration uses the **home-exchange branch's physical-source contract**:
+
+- `UltraEPLoadPlanner.update_placement()` emits no home proposal and lowers
+  the returned p2l map to `[EP, S]` current-home source slots. UltraEP keeps homes
+  fixed, so its logical IDs equal source-slot IDs in this planner.
+- `UltraEPTransport.prepare_plan()` constructs PR #2's three explicit maps from
+  those physical sources. Model logical identity never enters the transport.
+  It validates master-first inverse maps, one instance per expert per rank,
+  within-domain replication, and identical placement across EP ranks.
+- `weight_sync()` and `grad_reduce()` always receive explicit maps. The transport
+  does not change the manager's internal quota/reroute placement.
+- Router backward uses a snapshot of the actual dense token routes and p2l map.
+  This fully specifies the probability permutation after quota rerouting;
+  no backward reads an overwritten Manager slot. Simply cloning the three maps
+  and then calling UltraEP's native backward would not provide this guarantee.
+- A `split_grad_reduce` transport capability defers FC2's early reduction hook
+  for UltraEP. FC1/FC2 are reduced jointly after dispatch backward, then handed
+  to the existing runtime/GTP gradient path. Other backends keep split reduction.
+
+First-version boundaries:
+
+- BF16 weights and FP32 gradient storage for `replica_ultraep`; FP8/FP4 are rejected.
+- No MoE CUDA graph capture for either UltraEP component. Attention-only capture
+  retains the surrounding scheduler's existing policy.
+- Periodic home migration still requires EPLB + NCCL. UltraEP does not expose
+  the typed optimizer-state exchange needed by `HomeExpertDispatch`.
+- The UltraEP planner can use the existing NCCL or Peer-TMA replica transport
+  subject to their topology requirements. Other planners can use UltraEP
+  communication only when their physical tables satisfy its stricter constraints;
+  invalid placements are rejected, never silently rewritten.
+- Managers/buffers are per layer. With both UltraEP components selected, they
+  share one Manager. Planner-only use allocates minimal nonzero communication
+  scratch because upstream has no allocation-free public solver Manager.
+- Host placement validation and EP NCCL fences before/after each UltraEP
+  transfer prioritize correctness over overlap. The fences cover remote
+  producers, destination completion and replica-buffer reuse; this implementation
+  does not assume PR #2 resolves cross-rank completion by itself. No performance
+  or CUDA-graph equivalence with the upstream full-stack integration is claimed.
+- Native managers are finalized collectively by the existing replica-runtime
+  teardown. All ranks must construct and use layers in matching order; upstream
+  UltraEP supports one EP process group per process.
+
+Validation in the development container (four NVLink-connected GPUs, matching
+UltraEP build installed):
+
+```bash
+uv run python -m torch.distributed.run --nproc-per-node 4 -m pytest -q \
+  tests/unit_tests/transformer/moe/test_ultraep_moe_scheduler.py \
+  tests/unit_tests/transformer/moe/test_replica_weight_transport.py \
+  tests/unit_tests/transformer/moe/test_replica_ultraep_transport.py
+```
+
+The new tests cover map legality, router gradients after multiple forwards,
+joint-gradient scheduling, native weight/gradient round trips, fresh source
+pointers, repeated consumer-stream waits, and reuse of older plans. Native
+multi-GPU execution and end-to-end TE training remain validation requirements;
+host-only checks do not establish those results.
 
 # Performance Benchmarking
 

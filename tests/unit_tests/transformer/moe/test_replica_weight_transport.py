@@ -207,6 +207,33 @@ def test_runtime_gradient_handoff_keeps_fc2_first_and_reuses_the_backward_plan()
     assert runtime._backward_plan is None
 
 
+def test_joint_transport_defers_fc2_until_both_projection_gradients_are_ready():
+    runtime = _runtime()
+    runtime.transport.capabilities = replace(runtime.transport.capabilities, split_grad_reduce=False)
+    plan = _plan()
+    runtime.projections = tuple(
+        SimpleNamespace(native_grad=torch.ones(2, 4, 4), native_grad_bases=None, gtp_leader=None)
+        for _ in range(2)
+    )
+    runtime._backward_plan = plan
+    runtime._grad_reduce_plan = None
+    runtime._grad_reduce_started = set()
+    runtime._grad_reduce_handles = {}
+    runtime.start_fc2_grad_reduce()
+    assert not runtime._grad_reduce_started
+    assert not runtime._grad_reduce_handles
+    runtime.start_pending_grad_reduces(plan)
+    fc1 = runtime._grad_reduce_handles[0]
+    assert runtime._grad_reduce_handles[1] is fc1
+    assert fc1.keepalive[2] == (0, 1)
+    runtime.start_pending_grad_reduces(plan)
+    assert runtime._grad_reduce_handles[0] is fc1
+    with pytest.raises(RuntimeError, match="started twice"):
+        runtime.start_grad_reduce(plan, None)
+    assert len(runtime.wait_grad_reduce(plan)) == 4
+    assert runtime.transport.waited == [fc1, fc1]
+
+
 def test_plan_cache_does_not_reuse_recycled_slot_or_retain_finished_plan():
     runtime = _runtime()
     first = _plan()

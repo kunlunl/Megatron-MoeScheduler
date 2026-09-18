@@ -251,9 +251,12 @@ def test_replica_transport_factory_uses_expert_dispatcher_type(monkeypatch):
         create_replica_weight_transport("unsupported", config)
 
 
-def test_replica_dispatch_preserves_runtime_backward_order():
+@pytest.mark.parametrize("source_trainable", [False, True])
+@pytest.mark.parametrize("hidden_trainable", [False, True])
+def test_replica_dispatch_preserves_runtime_backward_order(source_trainable, hidden_trainable):
     events = []
-    parameter = torch.nn.Parameter(torch.ones(()))
+    parameter = torch.nn.Parameter(torch.ones(()), requires_grad=source_trainable)
+    router_scale = torch.nn.Parameter(torch.ones(()))
 
     class _Runtime:
         source_parameters = (parameter,)
@@ -295,15 +298,18 @@ def test_replica_dispatch_preserves_runtime_backward_order():
 
     dispatcher = _replica_dispatcher()
     dispatcher.runtime = _Runtime()
-    hidden = dispatcher.wrap_layer_input(torch.ones((), requires_grad=True))
+    original_hidden = torch.ones((), requires_grad=hidden_trainable)
+    hidden = dispatcher.wrap_layer_input(original_hidden)
     dispatcher.dispatch(torch.nn.Identity(), torch.tensor([[2, -1], [0, 1]]), _echo_context())
     hidden = dispatcher.before_token_dispatch(hidden)
     hidden = _BackwardMarker.apply(hidden, "dispatch_backward")
     hidden = dispatcher.after_token_dispatch(hidden)
     hidden = _BackwardMarker.apply(hidden, "expert_backward")
+    hidden = hidden * router_scale
     hidden = dispatcher.before_token_combine(hidden)
     hidden = _BackwardMarker.apply(hidden, "combine_backward")
     hidden = dispatcher.after_token_combine(hidden)
+    assert any(slot.in_use for slot in dispatcher._plan_slots)
     hidden.backward()
 
     # Pending reductions run after token dispatch backward; FC2's optional
@@ -319,7 +325,13 @@ def test_replica_dispatch_preserves_runtime_backward_order():
         "wait_grad_reduce",
     ]
     assert not any(slot.in_use for slot in dispatcher._plan_slots)
-    torch.testing.assert_close(parameter.grad, torch.ones_like(parameter))
+    if source_trainable:
+        torch.testing.assert_close(parameter.grad, torch.ones_like(parameter))
+    else:
+        assert parameter.grad is None
+    if not hidden_trainable:
+        assert original_hidden.grad is None
+    torch.testing.assert_close(router_scale.grad, torch.ones_like(router_scale))
 
 
 def test_echo_scheduler_runs_planner_and_dispatch_adapter():

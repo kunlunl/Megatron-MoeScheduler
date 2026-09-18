@@ -557,6 +557,7 @@ moe_scheduler_planner_type: ultra_ep
 moe_scheduler_expert_dispatcher_type: replica_ultraep
 moe_scheduler_num_idle_experts: 4  # global count; divisible by EP size
 moe_scheduler_home_update_interval: 0
+moe_expert_rank_capacity_factor: null  # dynamic, dropless receive size
 grad_reduce_in_bf16: false
 ```
 
@@ -582,6 +583,10 @@ The integration uses the **home-exchange branch's physical-source contract**:
 First-version boundaries:
 
 - BF16 weights and FP32 gradient storage for `replica_ultraep`; FP8/FP4 are rejected.
+- UltraEP keeps rank capacity dynamic when no factor is specified. Placement
+  does not guarantee an exactly balanced load, so an implicit fixed budget can
+  drop tokens. An explicitly selected fixed rank budget requires the caller's
+  overflow/retry handling, such as the Megatron training wrapper.
 - No MoE CUDA graph capture for either UltraEP component. Attention-only capture
   retains the surrounding scheduler's existing policy.
 - Periodic home migration still requires EPLB + NCCL. UltraEP does not expose
@@ -633,11 +638,12 @@ home-exchange regression cases passed on every rank; neither suite skipped cases
 
 The complete MoELayer test compares UltraEP with real HybridEP token dispatch
 against an unscheduled all-to-all reference for two forward/backward steps,
-including updated home weights. The reference handles zero-token ranks with
-their exact empty result because this TE revision rejects zero-row ScaledSwiGLU;
-empty individual expert slots are covered separately. Entirely empty scheduled
-ranks, full GPT training, UltraEP with GTP/FSDP, and performance remain separate
-validation requirements.
+including updated home weights. Fused experts handle zero-token ranks by running
+a zero-weighted padded batch and removing it before combine. This keeps wgrad
+overwrite and communication hooks active. Frozen expert weights still participate
+in transport collectives without receiving optimizer gradients; plan lifetime
+also covers router-only training. Full GPT training, UltraEP with GTP/FSDP, and
+performance remain separate validation requirements.
 
 # Performance Benchmarking
 

@@ -225,9 +225,10 @@ def test_ultraep_fused_experts_forward_backward_and_empty_slots(ultraep_group, m
             weight.zero_out_wgrad = True
         reference_weights.append(weights)
     try:
-        for counts in ((16, 16), (0, 16), (16, 0)):
+        for counts in ((16, 16), (0, 16), (16, 0), (0, 0)):
+            accumulated = 3 if sum(counts) == 0 else 0
             for parameter in parameters:
-                parameter.main_grad.zero_()
+                parameter.main_grad.fill_(accumulated)
                 parameter.grad = None
                 parameter.grad_added_to_main_grad = False
             for weights in reference_weights:
@@ -244,7 +245,11 @@ def test_ultraep_fused_experts_forward_backward_and_empty_slots(ultraep_group, m
             # Use the same TE arithmetic without replica dispatch. A hand-written
             # torch MLP rounds different intermediate values in BF16.
             token_counts = torch.tensor(counts, device="cuda", dtype=torch.int32)
-            reference, _ = reference_experts(ref_hidden, token_counts, ref_probs)
+            if sum(counts) == 0:
+                # The empty oracle has zero expert wgrad without invoking TE.
+                reference = ref_hidden + ref_probs.sum().to(ref_hidden.dtype) * 0
+            else:
+                reference, _ = reference_experts(ref_hidden, token_counts, ref_probs)
 
             wrapped = dispatcher.wrap_layer_input(hidden)
             dispatcher.dispatch(experts, placement, context)
@@ -267,7 +272,7 @@ def test_ultraep_fused_experts_forward_backward_and_empty_slots(ultraep_group, m
                     expected[source].add_(weights[projection].main_grad)
                 dist.all_reduce(expected, group=group)
                 torch.testing.assert_close(
-                    parameter.main_grad, expected[rank], rtol=0.03, atol=0.003
+                    parameter.main_grad, expected[rank] + accumulated, rtol=0.03, atol=0.003
                 )
             dispatcher.assert_idle()
     finally:
@@ -275,7 +280,11 @@ def test_ultraep_fused_experts_forward_backward_and_empty_slots(ultraep_group, m
         dist.destroy_process_group(tp_group)
 
 
-def test_ultraep_moe_layer_matches_unscheduled_alltoall(ultraep_group, monkeypatch):
+@pytest.mark.parametrize("replicate_hot_expert", [False, True])
+@pytest.mark.parametrize("freeze_experts", [False, True])
+def test_ultraep_moe_layer_matches_unscheduled_alltoall(
+    ultraep_group, monkeypatch, replicate_hot_expert, freeze_experts
+):
     """Exercise real routing, HybridEP tokens, TE compute and replica backward together."""
     from megatron.core.models.gpt.gpt_layer_specs import (
         get_gpt_layer_with_transformer_engine_submodules,
@@ -306,7 +315,12 @@ def test_ultraep_moe_layer_matches_unscheduled_alltoall(ultraep_group, monkeypat
         tp_dp_cp=group,
     )
     monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
-    monkeypatch.setenv("ULTRA_EP_QUOTA_MIN_TOKENS_PER_REPLICA", "1")
+    monkeypatch.setenv(
+        "ULTRA_EP_QUOTA_MIN_TOKENS_PER_REPLICA", "1" if replicate_hot_expert else "4096"
+    )
+    # The minimum quota is soft; a relaxed balance target makes the existing
+    # master-only placement feasible and deterministically avoids replication.
+    monkeypatch.setenv("ULTRA_EP_BALANCE_THRESHOLD", "1" if replicate_hot_expert else str(world))
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     config = _scheduler_config(
         num_moe_experts=world,
@@ -329,17 +343,6 @@ def test_ultraep_moe_layer_matches_unscheduled_alltoall(ultraep_group, monkeypat
         layer_number=1,
         pg_collection=pg,
     ).cuda()
-    reference_forward = reference.experts.forward
-
-    def reference_expert_forward(hidden, counts, probs):
-        # This TE revision's ScaledSwiGLU cannot build a TMA descriptor for zero
-        # rows. Unscheduled ranks with no tokens have exactly zero expert wgrad;
-        # preserve the empty input/probability autograd edges in the oracle.
-        if hidden.numel() == 0:
-            return hidden + probs.sum().to(hidden.dtype) * 0, None
-        return reference_forward(hidden, counts, probs)
-
-    monkeypatch.setattr(reference.experts, "forward", reference_expert_forward)
     torch.manual_seed(4321 + rank)
     with torch.no_grad():
         layer.router.weight.zero_()
@@ -353,6 +356,7 @@ def test_ultraep_moe_layer_matches_unscheduled_alltoall(ultraep_group, monkeypat
             actual.copy_(torch.randn_like(actual) / actual.shape[1] ** 0.5)
             expected.copy_(actual)
         for parameter in (actual, expected):
+            parameter.requires_grad_(not freeze_experts)
             parameter.main_grad = torch.zeros_like(parameter, dtype=torch.float32)
             parameter.grad_added_to_main_grad = False
             parameter.zero_out_wgrad = True
@@ -366,15 +370,25 @@ def test_ultraep_moe_layer_matches_unscheduled_alltoall(ultraep_group, monkeypat
                     parameter.grad_added_to_main_grad = False
             layer.router.weight.grad = None
             reference.router.weight.grad = None
-            hidden = torch.rand(64, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-            ref_hidden = hidden.detach().clone().requires_grad_()
+            hidden = torch.rand(
+                128, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=not freeze_experts
+            )
+            ref_hidden = hidden.detach().clone().requires_grad_(not freeze_experts)
             expected, _ = reference(ref_hidden)
             actual, _ = layer(hidden)
+            sources = layer.experts._replica_expert_runtime.last_plan.experts_to_copy
+            assert bool((sources >= 0).any()) == replicate_hot_expert
+            overflow = layer.token_dispatcher.check_over_budget().to(torch.int32)
+            dist.all_reduce(overflow, op=dist.ReduceOp.MAX, group=group)
+            assert not overflow.item(), "The scheduler's default path must not drop tokens."
             torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.003)
             grad = torch.randn_like(actual) / 10
             actual.backward(grad)
             expected.backward(grad)
-            torch.testing.assert_close(hidden.grad, ref_hidden.grad, rtol=0.03, atol=0.003)
+            if freeze_experts:
+                assert hidden.grad is None and ref_hidden.grad is None
+            else:
+                torch.testing.assert_close(hidden.grad, ref_hidden.grad, rtol=0.03, atol=0.003)
             torch.testing.assert_close(
                 layer.router.weight.grad, reference.router.weight.grad, rtol=0.03, atol=0.003
             )

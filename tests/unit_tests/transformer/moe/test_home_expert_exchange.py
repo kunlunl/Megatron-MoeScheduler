@@ -46,15 +46,19 @@ def _transport(group):
 
 
 @pytest.mark.parametrize("overwrite", [False, True])
-def test_replica_gradient_handoff_respects_fsdp_overwrite(distributed_world, overwrite):
+@pytest.mark.parametrize("trainable", [False, True])
+def test_replica_gradient_handoff_respects_fsdp_overwrite(distributed_world, overwrite, trainable):
     from megatron.core.transformer.moe.replica_expert_dispatch import _ReplicaWaitGradReduce
 
-    parameter = torch.nn.Parameter(torch.zeros(2, 3, device="cuda", dtype=torch.bfloat16))
+    parameter = torch.nn.Parameter(
+        torch.zeros(2, 3, device="cuda", dtype=torch.bfloat16), requires_grad=trainable
+    )
     parameter.main_grad = torch.full(
         (2, 3), float("nan") if overwrite else 7.0, device="cuda", dtype=torch.float32
     )
     parameter.grad_added_to_main_grad = False
     parameter.overwrite_main_grad = overwrite
+    original_grad = parameter.main_grad.clone()
     source = torch.arange(6, device="cuda", dtype=torch.float32).reshape(2, 3)
     context = SimpleNamespace(
         runtime=SimpleNamespace(
@@ -63,7 +67,12 @@ def test_replica_gradient_handoff_respects_fsdp_overwrite(distributed_world, ove
         context=SimpleNamespace(plan=None),
         num_source_parameters=1,
     )
-    _ReplicaWaitGradReduce.backward(context, torch.ones(1, device="cuda"))
+    gradients = _ReplicaWaitGradReduce.backward(context, torch.ones(1, device="cuda"))
+    if not trainable:
+        torch.testing.assert_close(parameter.main_grad, original_grad, equal_nan=True)
+        assert gradients[1] is None
+        assert not parameter.grad_added_to_main_grad
+        return
     expected = source if overwrite else source + 7
     torch.testing.assert_close(parameter.main_grad, expected, rtol=0, atol=0)
     assert parameter.grad_added_to_main_grad

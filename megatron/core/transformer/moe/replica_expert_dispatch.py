@@ -84,6 +84,11 @@ class _ReplicaWaitGradReduce(torch.autograd.Function):
 
         autograd_grads = []
         for parameter, source_grad in zip(ctx.runtime.source_parameters, source_grads):
+            if not parameter.requires_grad:
+                # Frozen owners still join transport reduction, but must not
+                # receive optimizer gradients through the manual main_grad path.
+                autograd_grads.append(None)
+                continue
             if source_grad is None or getattr(parameter, "is_gtp_weight_remat", False):
                 autograd_grads.append(source_grad)
                 continue
@@ -261,6 +266,13 @@ class ReplicaExpertDispatch(ExpertDispatch):
         context = self._forward_context = SimpleNamespace(plan=None, slot=None)
         if not torch.is_grad_enabled():
             return hidden_states
+        if not hidden_states.requires_grad and not any(
+            parameter.requires_grad for parameter in self.runtime.source_parameters
+        ):
+            # Router/shared-expert training can still require backward when
+            # expert weights and the incoming hidden state are frozen. Keep
+            # the plan and collective hooks alive without changing the caller's tensor.
+            hidden_states = hidden_states.detach().requires_grad_()
         hidden_states = _ReplicaPlanLifetime.apply(
             hidden_states, *self.runtime.source_parameters, self, context
         )

@@ -190,6 +190,45 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
     assert fused_ops.args[3] is tokens_per_expert
 
 
+def test_fused_forward_empty_batch_preserves_autograd_and_token_counts():
+    weight = torch.nn.Parameter(torch.ones(4, 4))
+    weight.grad = torch.full_like(weight, 3)
+    calls = []
+
+    class EmptyRejectingOps:
+        def __call__(self, hidden, fc1_tokens, probs, fc2_tokens):
+            assert hidden.shape[0] > 0
+            assert int(fc1_tokens.sum()) == hidden.shape[0]
+            torch.testing.assert_close(fc1_tokens, fc2_tokens)
+            calls.append(True)
+            return (hidden @ weight) * probs.unsqueeze(-1)
+
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(
+        fp8=False,
+        fp4=False,
+        use_transformer_engine_op_fuser=True,
+        moe_router_padding_for_quantization=False,
+        moe_token_dispatcher_type=None,
+        moe_flex_dispatcher_backend=None,
+        moe_paged_stash=False,
+        delay_offload_until_cuda_graph=False,
+    )
+    module._fused_ops = (EmptyRejectingOps(),)
+    hidden = torch.empty(0, 4, requires_grad=True)
+    probs = torch.empty(0, requires_grad=True)
+    counts = torch.zeros(2, dtype=torch.int32)
+
+    output = module._fused_forward(hidden, counts, probs)
+    assert output.shape == (0, 4)
+    output.sum().backward()
+    assert calls == [True]
+    torch.testing.assert_close(counts, torch.zeros_like(counts))
+    torch.testing.assert_close(hidden.grad, torch.empty_like(hidden))
+    torch.testing.assert_close(probs.grad, torch.empty_like(probs))
+    torch.testing.assert_close(weight.grad, torch.full_like(weight, 3))
+
+
 def test_apply_bias_returns_input_unchanged_when_bias_is_none():
     intermediate = torch.arange(6, dtype=torch.float32).view(3, 2)
 

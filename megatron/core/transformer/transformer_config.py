@@ -2143,7 +2143,15 @@ class TransformerConfig(ModelParallelConfig):
                     "Replica expert dispatch requires "
                     "at least one replica slot per expert-parallel rank."
                 )
-            if self.moe_expert_rank_capacity_factor is None:
+            # UltraEP can leave a rank above the mean load (for example when
+            # replicas are constrained). Preserve dynamic sizing by default:
+            # silently choosing a fixed budget would drop tokens unless the
+            # caller explicitly installs the overflow/retry training wrapper.
+            if (
+                self.moe_expert_rank_capacity_factor is None
+                and self.moe_scheduler_planner_type != "ultra_ep"
+                and self.moe_scheduler_expert_dispatcher_type != "replica_ultraep"
+            ):
                 self.moe_expert_rank_capacity_factor = 1.0
             replica_mxfp8 = (
                 self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
@@ -2194,8 +2202,9 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_ffn_hidden_size divisible by 128",
                 ),
                 (
-                    self.moe_expert_rank_capacity_factor >= 1.0,
-                    "moe_expert_rank_capacity_factor>=1.0",
+                    self.moe_expert_rank_capacity_factor is None
+                    or self.moe_expert_rank_capacity_factor >= 1.0,
+                    "moe_expert_rank_capacity_factor>=1.0 (or None for dynamic UltraEP sizing)",
                 ),
                 (
                     not self.moe_router_padding_for_quantization or replica_mxfp8,

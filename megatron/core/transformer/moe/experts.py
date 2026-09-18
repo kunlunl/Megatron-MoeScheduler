@@ -677,9 +677,7 @@ class TEGroupedMLP(MegatronModule):
             self.prepare_fused_impl_parameters()
             self._fused_impl_parameters_prepared = False
             if self._replica_expert_runtime is not None:
-                self._replica_expert_runtime.wait_prefetch(
-                    self._replica_expert_runtime.last_plan
-                )
+                self._replica_expert_runtime.wait_prefetch(self._replica_expert_runtime.last_plan)
                 self._replica_expert_runtime.consume_forward_source_weights()
 
         return forward_pre_hook
@@ -772,7 +770,16 @@ class TEGroupedMLP(MegatronModule):
             tokens_per_expert = torch.tensor(
                 tokens_per_expert, dtype=torch.int, device=permuted_probs.device
             )
-        # if the number of tokens is 0, pad the hidden states to 256
+        empty_input = permuted_local_hidden_states.shape[0] == 0
+        if empty_input:
+            # TE activations cannot create a zero-row TMA descriptor. Keep the
+            # fused ops and their backward hooks running so empty ranks still
+            # overwrite wgrad staging and join replica communication.
+            padding = get_align_size_for_quantization(self.config)
+            permuted_local_hidden_states = F.pad(permuted_local_hidden_states, (0, 0, 0, padding))
+            permuted_probs = F.pad(permuted_probs, (0, padding))
+            tokens_per_expert = tokens_per_expert.clone()
+            tokens_per_expert[0] = padding
 
         if self.config.moe_paged_stash:
             permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states)
@@ -816,6 +823,8 @@ class TEGroupedMLP(MegatronModule):
             delay_offload=self.config.delay_offload_until_cuda_graph,
         )
         # Remove padding if needed
+        if empty_input:
+            output = output[:0]
         if unpadded_tokens_per_expert is not None:
             output = self.quantization_unpadding(output, unpadded_tokens_per_expert)
         if self.config.moe_paged_stash:
@@ -1025,9 +1034,7 @@ class TEGroupedMLP(MegatronModule):
                 num_global_experts = _num_checkpoint_global_experts(
                     self, num_local_checkpoint_experts
                 )
-                local_expert_indices_offset = (
-                    self.ep_group.rank() * num_local_checkpoint_experts
-                )
+                local_expert_indices_offset = self.ep_group.rank() * num_local_checkpoint_experts
                 ep_axis = len(sharded_offsets)
                 for i in range(num_local_checkpoint_experts):
                     if singleton_local_shards:

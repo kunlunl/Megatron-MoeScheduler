@@ -964,5 +964,8 @@ def finalize_replica_expert_runtimes() -> None:
 
     for runtime in list(_replica_expert_runtimes):
         runtime.destroy()
+
+    # finalize_replica_weight_transports() invokes UltraEP's _finalize_managers
+    # callback to release both transport and standalone planner Managers.
     finalize_replica_weight_transports()
     finalize_moonep_planner_workspaces()

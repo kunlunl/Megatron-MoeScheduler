@@ -268,8 +268,11 @@ class MoEScheduler(torch.nn.Module):
         elif planner_type == "ultra_ep":
             from megatron.core.transformer.moe.ultraep_moe_scheduler import UltraEPLoadPlanner
 
-            # Share the per-layer Manager when both components use UltraEP.
-            # Other transports leave planner communication storage minimal.
+            # When both planner and transport use UltraEP, sharing one Manager saves
+            # memory by avoiding a separate planner Manager and its buffers.
+            # With another transport, the planner needs its own UltraEP Manager, which
+            # adds memory on top of the transport's allocations. Its unused weight buffers
+            # use minimal dummy sizes to limit this extra memory.
             manager_provider = (
                 (lambda: expert_dispatch.runtime.transport.manager)
                 if expert_dispatcher_type == "replica_ultraep"

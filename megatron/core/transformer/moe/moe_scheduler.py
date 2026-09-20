@@ -145,7 +145,13 @@ class MoELoadPlanner(torch.nn.Module, ABC):
         *,
         tokens_per_expert: Optional[torch.Tensor] = None,
     ) -> tuple[Optional[HomeExpertPlacement], Optional[torch.Tensor], MoEPlacementResult]:
-        """Return optional home exchange, replica copies, and private reroute state."""
+        """Return optional home exchange, replica copies, and private reroute state.
+
+        Placement is separate from ``reroute()`` so the scheduler can start
+        asynchronous replica-weight dispatch as soon as placement is known.
+        It then calls ``reroute()`` while the weight transfer is in flight,
+        allowing weight communication to overlap token-reroute computation.
+        """
 
     def step(self, completed_version: Optional[int] = None) -> None:
         """Commit completed home placement after a successful optimizer update."""
@@ -160,7 +166,13 @@ class MoELoadPlanner(torch.nn.Module, ABC):
         placement_result: MoEPlacementResult,
         context: SchedulerContext,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return dense physical ``routing_map`` and ``probs`` tensors."""
+        """Return dense physical ``routing_map`` and ``probs`` tensors.
+
+        Consume the state returned by ``update_placement()``. Replica-weight
+        dispatch may still be in flight: rerouting uses only routing and
+        placement metadata, so it can proceed before replica weights arrive.
+        The expert runtime waits for those weights before expert computation.
+        """
 
 
 class ExpertDispatch(torch.nn.Module, ABC):

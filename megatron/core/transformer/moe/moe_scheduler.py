@@ -175,7 +175,10 @@ class ExpertDispatch(torch.nn.Module, ABC):
 
     @abstractmethod
     def dispatch(
-        self, experts: torch.nn.Module, expert_placement: torch.Tensor, context: SchedulerContext
+        self,
+        experts: torch.nn.Module,
+        expert_placement: torch.Tensor,
+        context: SchedulerContext,
     ) -> None:
         """Materialize the planned expert placement before token dispatch begins."""
 

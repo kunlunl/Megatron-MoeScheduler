@@ -677,7 +677,9 @@ class TEGroupedMLP(MegatronModule):
             self.prepare_fused_impl_parameters()
             self._fused_impl_parameters_prepared = False
             if self._replica_expert_runtime is not None:
-                self._replica_expert_runtime.wait_prefetch(self._replica_expert_runtime.last_plan)
+                self._replica_expert_runtime.wait_prefetch(
+                    self._replica_expert_runtime.last_plan
+                )
                 self._replica_expert_runtime.consume_forward_source_weights()
 
         return forward_pre_hook
@@ -1034,7 +1036,9 @@ class TEGroupedMLP(MegatronModule):
                 num_global_experts = _num_checkpoint_global_experts(
                     self, num_local_checkpoint_experts
                 )
-                local_expert_indices_offset = self.ep_group.rank() * num_local_checkpoint_experts
+                local_expert_indices_offset = (
+                    self.ep_group.rank() * num_local_checkpoint_experts
+                )
                 ep_axis = len(sharded_offsets)
                 for i in range(num_local_checkpoint_experts):
                     if singleton_local_shards:

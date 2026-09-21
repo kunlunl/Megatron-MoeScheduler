@@ -3240,10 +3240,6 @@ class TransformerConfig(ModelParallelConfig):
         self.cuda_graph_modules = normalized_scopes
         if (
             self.moe_enable_scheduler
-            and (
-                self.moe_scheduler_expert_dispatcher_type in ("replica_nccl", "replica_ultraep")
-                or self.moe_scheduler_planner_type == "ultra_ep"
-            )
             and self.cuda_graph_impl != "none"
             and (
                 self.cuda_graph_impl == "full_iteration"
@@ -3256,7 +3252,11 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "replica_nccl host schedules do not support MoE CUDA graph capture."
                 )
-            raise ValueError("UltraEP integration does not support MoE CUDA graph capture.")
+            elif (
+                self.moe_scheduler_planner_type == "ultra_ep"
+                or self.moe_scheduler_expert_dispatcher_type == "replica_ultraep"
+            ):
+                raise ValueError("UltraEP integration does not support MoE CUDA graph capture.")
         assert all(
             isinstance(scope, CudaGraphModule) for scope in self.cuda_graph_modules
         ), f"cuda_graph_modules must be a list of CudaGraphModule, got {self.cuda_graph_modules}."

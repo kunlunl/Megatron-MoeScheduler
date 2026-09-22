@@ -639,13 +639,23 @@ PyTorch 26.06 and TE batch-GEMM `55d6a453`. Another 186 Echo/EPLB/MoonEP/NCCL an
 home-exchange regression cases passed on every rank; neither suite skipped cases.
 
 The complete MoELayer test compares UltraEP with real HybridEP token dispatch
-against an unscheduled all-to-all reference for two forward/backward steps,
-including updated home weights. Fused experts handle zero-token ranks by running
-a zero-weighted padded batch and removing it before combine. This keeps wgrad
+against an unscheduled all-to-all reference for 20 forward/backward steps,
+with 16,384 tokens per rank, hidden size 4,096 and FFN size 2,048. Routing is
+concentrated on expert 0 to exercise both replicated and unreplicated hotspots,
+including refreshed replicas after home-weight updates. Fused experts handle
+zero-token ranks by running a zero-weighted padded batch and removing it before
+combine. This keeps wgrad
 overwrite and communication hooks active. Frozen expert weights still participate
 in transport collectives without receiving optimizer gradients; plan lifetime
 also covers router-only training. Full GPT training, UltraEP with GTP/FSDP, and
 performance remain separate validation requirements.
+
+Rank 0 prints `ULTRAEP_MOE_LAYER` records with each EP rank's received token count
+and synchronized forward/backward wall times for both paths, in milliseconds.
+`ULTRAEP_MOE_LAYER_SUMMARY` reports medians after five warmup iterations: each
+phase takes the slowest rank, and the total sums both phases within each iteration.
+Printing, diagnostic collectives and manual weight updates are outside the timers.
+These isolated layer timings are observations, not performance assertions.
 
 # Performance Benchmarking
 

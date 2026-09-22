@@ -356,7 +356,8 @@ materialization ran.
 | `tests/unit_tests/transformer/moe/test_replica_weight_transport.py` | Plan ownership, layout, completion lifetime, and placeholder contracts. |
 | `tests/unit_tests/transformer/moe/test_replica_nccl_transport.py` | NCCL weight/gradient parity, strided EP subgroups, empty ranks, and stream completion. |
 | `tests/unit_tests/transformer/moe/test_ultraep_moe_scheduler.py` | UltraEP API, placement, configuration and saved-router contracts. |
-| `tests/unit_tests/transformer/moe/test_replica_ultraep_transport.py` | Native UltraEP communication, fused TE and full MoELayer parity. |
+| `tests/unit_tests/transformer/moe/test_replica_ultraep_transport.py` | Native UltraEP communication and fused TE expert parity. |
+| `tests/unit_tests/transformer/moe/test_ultraep_moe_layer.py` | Complete MoELayer forward/backward numerical parity against an unscheduled all-to-all reference. |
 
 ## Replica Transport Contract
 
@@ -619,7 +620,8 @@ uv run python -m torch.distributed.run --nproc-per-node 4 -m pytest -q \
   tests/unit_tests/transformer/moe/test_moe_scheduler.py \
   tests/unit_tests/transformer/moe/test_ultraep_moe_scheduler.py \
   tests/unit_tests/transformer/moe/test_replica_weight_transport.py \
-  tests/unit_tests/transformer/moe/test_replica_ultraep_transport.py
+  tests/unit_tests/transformer/moe/test_replica_ultraep_transport.py \
+  tests/unit_tests/transformer/moe/test_ultraep_moe_layer.py
 ```
 
 The new tests cover map legality, router gradients after multiple forwards

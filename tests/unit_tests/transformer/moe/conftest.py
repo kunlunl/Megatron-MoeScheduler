@@ -25,6 +25,26 @@ def cleanup():
         torch.distributed.destroy_process_group()
 
 
+@pytest.fixture(scope="session")
+def ultraep_group(cleanup):
+    """Share UltraEP's runtime across test files and release it before WORLD cleanup."""
+    from megatron.core.transformer.moe.replica_weight_transport import (
+        finalize_replica_weight_transports,
+    )
+
+    pytest.importorskip("ultra_ep")
+    if not torch.cuda.is_available():
+        pytest.skip("UltraEP requires CUDA/NVLink.")
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group("nccl")
+    # Both native test modules use one EP group and one shared runtime lifetime.
+    yield torch.distributed.group.WORLD
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    finalize_replica_weight_transports()
+
+
 @pytest.fixture(scope="function", autouse=True)
 def set_env():
     """Configure TE env vars for MoE unit tests.

@@ -961,11 +961,13 @@ def finalize_replica_expert_runtimes() -> None:
     from megatron.core.transformer.moe.moonep_moe_scheduler import (
         finalize_moonep_planner_workspaces,
     )
+    from megatron.core.transformer.moe.ultraep_backend import finalize_ultraep_managers
 
     for runtime in list(_replica_expert_runtimes):
         runtime.destroy()
 
-    # finalize_replica_weight_transports() invokes UltraEP's _finalize_managers
-    # callback to release both transport and standalone planner Managers.
     finalize_replica_weight_transports()
     finalize_moonep_planner_workspaces()
+    # Transport/runtime consumers must drain before shared NVSHMEM buffers are freed.
+    # This registry also includes standalone planner Managers.
+    finalize_ultraep_managers()

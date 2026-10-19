@@ -60,3 +60,94 @@ index a4ec404..1df35b1 100644
      def __init__(
          self,
          group: dist.ProcessGroup,
+diff --git a/tests/test_multi_manager_lifetime.py b/tests/test_multi_manager_lifetime.py
+new file mode 100644
+index 0000000..560966e
+--- /dev/null
++++ b/tests/test_multi_manager_lifetime.py
+@@ -0,0 +1,85 @@
++"""Run with torchrun -m pytest on at least two NVLink-connected GPUs."""
++
++import os
++
++import pytest
++import torch
++import torch.distributed as dist
++
++from ultra_ep import Manager
++
++
++def test_multi_manager_lifetime(monkeypatch):
++    """A surviving Manager must still plan and copy weights after another is destroyed."""
++    if not torch.cuda.is_available():
++        pytest.skip("Requires CUDA and NVLink.")
++    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
++    owns_group = not dist.is_initialized()
++    if owns_group:
++        dist.init_process_group("nccl")
++    group = dist.group.WORLD
++    rank, world = dist.get_rank(group), dist.get_world_size(group)
++    if world < 2:
++        if owns_group:
++            dist.destroy_process_group()
++        pytest.skip("Requires at least two EP ranks.")
++    monkeypatch.setenv("ULTRA_EP_QUOTA_MIN_TOKENS_PER_REPLICA", "1")
++    monkeypatch.setenv("ULTRA_EP_BALANCE_THRESHOLD", "1")
++    managers = []
++    try:
++        for _ in range(2):
++            managers.append(
++                Manager(
++                    group=group,
++                    num_layers=1,
++                    num_local_master_experts=1,
++                    num_local_redundant_experts=1,
++                    expert_fc1_numel=8,
++                    expert_fc2_numel=8,
++                    is_train=False,
++                    explicitly_destroy=True,
++                )
++            )
++        survivor = managers[1]
++        fc1 = torch.full((8,), rank + 1, dtype=torch.bfloat16, device="cuda")
++        fc2 = torch.full((8,), rank + 101, dtype=torch.bfloat16, device="cuda")
++        survivor.construct_local_master_ptr_pool(0, [fc1], [fc2])
++        torch.cuda.synchronize()
++        dist.barrier(group=group)
++        managers[0].destroy()
++        torch.cuda.synchronize()
++        dist.barrier(group=group)
++
++        routing_map = torch.zeros(4096, world, dtype=torch.bool, device="cuda")
++        routing_map[:, 0] = True
++        p2l, _, _ = survivor.update_placement(0, routing_map)
++        torch.cuda.synchronize()
++        dist.barrier(group=group)
++        survivor.weight_sync(0, async_finish=True).current_stream_wait()
++        torch.cuda.synchronize()
++        dist.barrier(group=group)
++        source = int(p2l.view(world, 2)[rank, 1])
++        active = torch.tensor(source >= 0, dtype=torch.int32, device="cuda")
++        dist.all_reduce(active, group=group)
++        assert active.item() > 0, "The regression must exercise replica communication."
++        if source >= 0:
++            torch.testing.assert_close(
++                survivor.local_replica_fc1_weight_buffer.reshape(-1),
++                torch.full_like(fc1, source + 1),
++                rtol=0,
++                atol=0,
++            )
++            torch.testing.assert_close(
++                survivor.local_replica_fc2_weight_buffer.reshape(-1),
++                torch.full_like(fc2, source + 101),
++                rtol=0,
++                atol=0,
++            )
++    finally:
++        torch.cuda.synchronize()
++        dist.barrier(group=group)
++        for manager in managers:
++            if manager.runtime is not None:
++                manager.destroy()
++        if owns_group:
++            dist.destroy_process_group()

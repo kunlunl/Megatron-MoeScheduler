@@ -28,8 +28,8 @@ def cleanup():
 @pytest.fixture(scope="session")
 def ultraep_group(cleanup):
     """Share UltraEP's runtime across test files and release it before WORLD cleanup."""
-    from megatron.core.transformer.moe.replica_weight_transport import (
-        finalize_replica_weight_transports,
+    from megatron.core.transformer.moe.replica_expert_runtime import (
+        finalize_replica_expert_runtimes,
     )
 
     pytest.importorskip("ultra_ep")
@@ -42,7 +42,7 @@ def ultraep_group(cleanup):
     yield torch.distributed.group.WORLD
     torch.cuda.synchronize()
     torch.distributed.barrier()
-    finalize_replica_weight_transports()
+    finalize_replica_expert_runtimes()
 
 
 @pytest.fixture(scope="function", autouse=True)

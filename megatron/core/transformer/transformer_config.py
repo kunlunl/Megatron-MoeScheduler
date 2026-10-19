@@ -944,7 +944,7 @@ class TransformerConfig(ModelParallelConfig):
     remains the same after scheduler preprocessing."""
 
     moe_scheduler_planner_type: Literal['echo', 'eplb', 'moon_ep', 'ultra_ep'] = "echo"
-    """Planner backend: 'echo', 'eplb', 'moon_ep', or UltraEP PR #2's 'ultra_ep'."""
+    """Planner backend: 'echo', 'eplb', 'moon_ep', or 'ultra_ep'."""
 
     moe_scheduler_expert_dispatcher_type: Literal[
         'replica_peer_tma', 'replica_hybridep', 'replica_nccl', 'replica_ultraep'
@@ -954,7 +954,7 @@ class TransformerConfig(ModelParallelConfig):
     The single replica expert dispatcher uses this value to select its weight transport.
     ``replica_peer_tma`` selects the existing symmetric-memory peer-TMA transport.
     ``replica_nccl`` selects packed NCCL P2P for BF16/MXFP8 weights with host planning.
-    ``replica_ultraep`` selects UltraEP PR #2 with BF16 weights and FP32 joint gradients.
+    ``replica_ultraep`` selects UltraEP communication with BF16 weights and FP32 joint gradients.
     ``replica_hybridep`` is a reserved, unimplemented transport.
     Existing configs using the old ``replica_hybridep`` name must use ``replica_peer_tma``.
     """

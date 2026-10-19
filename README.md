@@ -584,6 +584,10 @@ The integration uses the **home-exchange branch's physical-source contract**:
 First-version boundaries:
 
 - BF16 weights and FP32 gradient storage for `replica_ultraep`; FP8/FP4 are rejected.
+  This is the current adapter's scope. Upstream UltraEP accepts configurable
+  weight-data/scale dtypes and scale sizes. TE MXFP8 integration additionally needs
+  rowwise/columnwise data and scale buffers, matching backward restoration and
+  numerical tests; those bindings are not implemented by this adapter yet.
 - UltraEP keeps rank capacity dynamic when no factor is specified. Placement
   does not guarantee an exactly balanced load, so an implicit fixed budget can
   drop tokens. An explicitly selected fixed rank budget requires the caller's
@@ -599,6 +603,10 @@ First-version boundaries:
 - Managers/buffers are per layer. With both UltraEP components selected, they
   share one Manager. Planner-only use allocates minimal nonzero communication
   scratch because upstream has no allocation-free public solver Manager.
+  An independently constructed `UltraEPLoadPlanner` without `manager_provider`
+  uses its own minimal Manager; both ownership choices are tested. Sharing avoids
+  a second set of global placement/quota tables, whose size grows with EP size
+  and expert count.
 - Host placement validation and EP NCCL fences before/after each UltraEP
   transfer prioritize correctness over overlap. The fences cover remote
   producers, destination completion and replica-buffer reuse; this implementation
@@ -609,7 +617,9 @@ First-version boundaries:
 - Native managers are finalized collectively by the existing replica-runtime
   teardown. Per-layer transport destruction first drains its communication
   stream and releases its native-gradient staging; native NVSHMEM buffers remain
-  alive until collective finalization. All ranks must construct and use layers
+  alive until the dedicated `finalize_ultraep_managers()` call, after runtime and
+  transport cleanup. This also releases independent planner Managers.
+  All ranks must construct and use layers
   in matching order; upstream UltraEP supports one EP process group per process.
 
 Validation in the development container (four NVLink-connected GPUs, matching
@@ -656,6 +666,13 @@ and synchronized forward/backward wall times for both paths, in milliseconds.
 phase takes the slowest rank, and the total sums both phases within each iteration.
 Printing, diagnostic collectives and manual weight updates are outside the timers.
 These isolated layer timings are observations, not performance assertions.
+
+The multi-microbatch test runs `F1 -> F2 -> B2 -> B1` with positive/negative
+inputs targeting different hot experts. Both experts receive nonzero contributions
+from each microbatch, while the dominant expert and replica placement change.
+It compares outputs, input/router gradients and accumulated expert gradients
+without clearing between backwards, across three optimizer steps. It covers
+shared and independent planner/transport Managers, with trainable and frozen experts.
 
 # Performance Benchmarking
 

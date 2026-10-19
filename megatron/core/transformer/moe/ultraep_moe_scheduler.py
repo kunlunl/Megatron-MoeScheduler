@@ -29,7 +29,7 @@ class UltraEPPlacementResult(MoEPlacementResult):
 class _SnapshotReroute(torch.autograd.Function):
     """Use UltraEP's quota forward; keep its exact token assignment for backward.
 
-    UltraEP PR #2 does not export a self-contained quota plan. Its own backward
+    UltraEP does not export a self-contained quota plan. Its own backward
     reads mutable manager placement. Instead save the actual dense routing mask
     and a placement snapshot: they completely specify the permutation of probs.
     Later microbatches may then reuse the manager slot without changing backward.
@@ -64,6 +64,9 @@ class UltraEPLoadPlanner(MoELoadPlanner):
     The planner emits no home migration. Consequently its logical IDs equal
     current physical source-home IDs. The returned replica table is [EP, S],
     rather than the full logical p2l table used by the pre-home-exchange branch.
+    With no manager_provider, planning owns a minimal Manager independent from
+    the weight transport. The scheduler supplies a provider by default when
+    both components use UltraEP, avoiding duplicate placement/quota storage.
     """
 
     planner_name = "ultra_ep"
@@ -139,7 +142,7 @@ class UltraEPLoadPlanner(MoELoadPlanner):
         manager = self._get_manager(context)
         maps = manager.update_placement(0, routing_map.contiguous())
         if not isinstance(maps, tuple) or len(maps) != 3:
-            raise RuntimeError("UltraEP update_placement must return the PR #2 placement maps.")
+            raise RuntimeError("UltraEP update_placement must return the three placement maps.")
         # These are borrowed views. Own the map before the next update overwrites it.
         p2l = maps[0].clone()
         placement = UltraEPPlacementResult(manager, p2l)

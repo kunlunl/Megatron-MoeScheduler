@@ -14,28 +14,16 @@ import torch.distributed as dist
 pytestmark = pytest.mark.launch_on_gb200
 
 
-@pytest.mark.parametrize("replicate_hot_expert", [False, True])
-@pytest.mark.parametrize("freeze_experts", [False, True])
-def test_ultraep_moe_layer_matches_unscheduled_alltoall(
-    ultraep_group, monkeypatch, replicate_hot_expert, freeze_experts
-):
-    """Exercise real routing, HybridEP tokens, TE compute and replica backward together."""
+def _make_moe_layer_pair(config, group, freeze_experts):
+    """Build independent weights with matching TE arithmetic and process groups."""
     from megatron.core.models.gpt.gpt_layer_specs import (
         get_gpt_layer_with_transformer_engine_submodules,
     )
     from megatron.core.process_groups_config import ProcessGroupCollection
-    from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP, reset_hybrid_ep_buffer
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.spec_utils import get_submodules
-    from tests.unit_tests.transformer.moe.scheduler_test_utils import _scheduler_config
 
-    if not HAVE_HYBRIDEP:
-        pytest.skip("Requires the HybridEP token dispatcher.")
-    group = ultraep_group
     rank, world = dist.get_rank(group), dist.get_world_size(group)
-    num_tokens = 16384
-    num_iterations = 20
-    num_warmup_iterations = 5
     single_rank_group = None
     for owner in range(world):
         candidate = dist.new_group([owner], backend="nccl")
@@ -50,26 +38,6 @@ def test_ultraep_moe_layer_matches_unscheduled_alltoall(
         tp_ep=group,
         tp_cp=single_rank_group,
         tp_dp_cp=group,
-    )
-    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
-    monkeypatch.setenv(
-        "ULTRA_EP_QUOTA_MIN_TOKENS_PER_REPLICA",
-        "1" if replicate_hot_expert else str(num_tokens * world + 1),
-    )
-    # The minimum quota is soft; a relaxed balance target makes the existing
-    # master-only placement feasible and deterministically avoids replication.
-    monkeypatch.setenv("ULTRA_EP_BALANCE_THRESHOLD", "1" if replicate_hot_expert else str(world))
-    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    config = _scheduler_config(
-        hidden_size=4096,
-        moe_ffn_hidden_size=2048,
-        num_moe_experts=world,
-        expert_model_parallel_size=world,
-        moe_scheduler_num_idle_experts=world,
-        moe_scheduler_planner_type="ultra_ep",
-        moe_scheduler_expert_dispatcher_type="replica_ultraep",
-        moe_router_load_balancing_type="none",
-        use_cpu_initialization=False,
     )
     submodules = get_submodules(
         get_gpt_layer_with_transformer_engine_submodules(
@@ -102,6 +70,47 @@ def test_ultraep_moe_layer_matches_unscheduled_alltoall(
             parameter.grad_added_to_main_grad = False
             parameter.zero_out_wgrad = True
         pairs.append((actual, expected))
+
+    return layer, reference, pairs, single_rank_group
+
+
+@pytest.mark.parametrize("replicate_hot_expert", [False, True])
+@pytest.mark.parametrize("freeze_experts", [False, True])
+def test_ultraep_moe_layer_matches_unscheduled_alltoall(
+    ultraep_group, monkeypatch, replicate_hot_expert, freeze_experts
+):
+    """Exercise real routing, HybridEP tokens, TE compute and replica backward together."""
+    from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP, reset_hybrid_ep_buffer
+    from tests.unit_tests.transformer.moe.scheduler_test_utils import _scheduler_config
+
+    if not HAVE_HYBRIDEP:
+        pytest.skip("Requires the HybridEP token dispatcher.")
+    group = ultraep_group
+    rank, world = dist.get_rank(group), dist.get_world_size(group)
+    num_tokens = 16384
+    num_iterations = 20
+    num_warmup_iterations = 5
+    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+    monkeypatch.setenv(
+        "ULTRA_EP_QUOTA_MIN_TOKENS_PER_REPLICA",
+        "1" if replicate_hot_expert else str(num_tokens * world + 1),
+    )
+    # The minimum quota is soft; a relaxed balance target makes the existing
+    # master-only placement feasible and deterministically avoids replication.
+    monkeypatch.setenv("ULTRA_EP_BALANCE_THRESHOLD", "1" if replicate_hot_expert else str(world))
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    config = _scheduler_config(
+        hidden_size=4096,
+        moe_ffn_hidden_size=2048,
+        num_moe_experts=world,
+        expert_model_parallel_size=world,
+        moe_scheduler_num_idle_experts=world,
+        moe_scheduler_planner_type="ultra_ep",
+        moe_scheduler_expert_dispatcher_type="replica_ultraep",
+        moe_router_load_balancing_type="none",
+        use_cpu_initialization=False,
+    )
+    layer, reference, pairs, single_rank_group = _make_moe_layer_pair(config, group, freeze_experts)
 
     observed_counts = {}
     timings = {}
@@ -252,6 +261,140 @@ def test_ultraep_moe_layer_matches_unscheduled_alltoall(
     finally:
         for hook in hooks:
             hook.remove()
+        layer.experts._replica_expert_runtime.destroy()
+        reset_hybrid_ep_buffer()
+        dist.destroy_process_group(single_rank_group)
+
+
+@pytest.mark.parametrize("manager_ownership", ["shared", "separate"])
+@pytest.mark.parametrize("freeze_experts", [False, True])
+def test_ultraep_moe_layer_accumulates_gradients_with_inflight_microbatches(
+    ultraep_group, monkeypatch, manager_ownership, freeze_experts
+):
+    """Exercise F1 -> F2 -> B2 -> B1 with different plans and accumulated gradients."""
+    from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP, reset_hybrid_ep_buffer
+    from megatron.core.transformer.moe.ultraep_moe_scheduler import UltraEPLoadPlanner
+    from tests.unit_tests.transformer.moe.scheduler_test_utils import _scheduler_config
+
+    if not HAVE_HYBRIDEP:
+        pytest.skip("Requires the HybridEP token dispatcher.")
+    group = ultraep_group
+    rank, world = dist.get_rank(group), dist.get_world_size(group)
+    if world < 4:
+        pytest.skip("Changing placement with two participating experts requires four EP ranks.")
+    num_tokens = 4096
+    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+    monkeypatch.setenv("ULTRA_EP_QUOTA_MIN_TOKENS_PER_REPLICA", "1")
+    monkeypatch.setenv("ULTRA_EP_BALANCE_THRESHOLD", "1")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    config = _scheduler_config(
+        hidden_size=1024,
+        moe_ffn_hidden_size=512,
+        num_moe_experts=world,
+        expert_model_parallel_size=world,
+        moe_scheduler_num_idle_experts=world,
+        moe_scheduler_planner_type="ultra_ep",
+        moe_scheduler_expert_dispatcher_type="replica_ultraep",
+        moe_router_load_balancing_type="none",
+        use_cpu_initialization=False,
+    )
+    layer, reference, pairs, single_rank_group = _make_moe_layer_pair(config, group, freeze_experts)
+    if manager_ownership == "separate":
+        layer.moe_scheduler.planner = UltraEPLoadPlanner(world, group)
+    with torch.no_grad():
+        # Positive/negative microbatches select expert 0/1 with fixed router weights.
+        layer.router.weight[1].fill_(-2.56 / config.hidden_size)
+        reference.router.weight.copy_(layer.router.weight)
+
+    try:
+        for step in range(3):
+            # Clear once per optimizer step; both backwards must accumulate into these buffers.
+            for actual, expected in pairs:
+                for parameter in (actual, expected):
+                    parameter.main_grad.zero_()
+                    parameter.grad = None
+                    parameter.grad_added_to_main_grad = False
+            layer.router.weight.grad = None
+            reference.router.weight.grad = None
+            microbatches = []
+            placements = []
+            for hot_expert, sign in enumerate((1, -1)):
+                hidden = sign * torch.rand(
+                    num_tokens, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
+                )
+                # Both microbatches train experts 0 and 1; switch the dominant expert
+                # while retaining a minority contribution to the other one's gradient.
+                hidden[: num_tokens // 8].neg_()
+                hidden.requires_grad_(not freeze_experts)
+                ref_hidden = hidden.detach().clone().requires_grad_(not freeze_experts)
+                expected, _ = reference(ref_hidden)
+                actual, _ = layer(hidden)
+                torch.testing.assert_close(actual, expected, rtol=0.03, atol=0.003)
+                plan = layer.experts._replica_expert_runtime.last_plan
+                placement = plan.experts_to_copy.clone()
+                assert bool((placement == hot_expert).any())
+                placements.append(placement)
+                planner_manager = layer.moe_scheduler.planner._manager
+                transport_manager = layer.experts._replica_expert_runtime.transport.manager
+                assert (planner_manager is transport_manager) == (manager_ownership == "shared")
+                overflow = layer.token_dispatcher.check_over_budget().to(torch.int32)
+                dist.all_reduce(overflow, op=dist.ReduceOp.MAX, group=group)
+                assert not overflow.item(), "The scheduler must preserve every token."
+                grad = torch.randn_like(actual) / num_tokens**0.5
+                microbatches.append((hidden, ref_hidden, actual, expected, grad))
+            assert not torch.equal(placements[0], placements[1])
+
+            # F2 has overwritten the planner slot and replica weights while F1 remains live.
+            first_grads = []
+            for backward_index, (hidden, ref_hidden, actual, expected, grad) in enumerate(
+                reversed(microbatches)
+            ):
+                actual.backward(grad)
+                expected.backward(grad)
+                if freeze_experts:
+                    assert hidden.grad is None and ref_hidden.grad is None
+                else:
+                    torch.testing.assert_close(hidden.grad, ref_hidden.grad, rtol=0.03, atol=0.003)
+                torch.testing.assert_close(
+                    layer.router.weight.grad, reference.router.weight.grad, rtol=0.03, atol=0.003
+                )
+                for projection, (actual_weight, expected_weight) in enumerate(pairs):
+                    torch.testing.assert_close(
+                        actual_weight.main_grad, expected_weight.main_grad, rtol=0.03, atol=0.003
+                    )
+                    if freeze_experts:
+                        assert not torch.count_nonzero(actual_weight.main_grad).item()
+                    elif rank < 2:
+                        if backward_index == 0:
+                            assert torch.count_nonzero(actual_weight.main_grad).item()
+                            first_grads.append(actual_weight.main_grad.clone())
+                        else:
+                            assert not torch.equal(actual_weight.main_grad, first_grads[projection])
+            layer.moe_scheduler.expert_dispatch.assert_idle()
+            # The next optimizer step must refresh replicas from the accumulated home update.
+            with torch.no_grad():
+                for actual_weight, expected_weight in pairs:
+                    actual_weight.add_(
+                        actual_weight.main_grad.to(actual_weight.dtype),
+                        alpha=-0.1 / config.hidden_size,
+                    )
+                    if rank < 2 and not freeze_experts:
+                        assert not torch.equal(actual_weight, expected_weight)
+                    expected_weight.copy_(actual_weight)
+            if rank == 0:
+                print(
+                    "ULTRAEP_MICROBATCH "
+                    + json.dumps(
+                        dict(
+                            step=step + 1,
+                            manager_ownership=manager_ownership,
+                            freeze_experts=freeze_experts,
+                            schedule="F1 F2 B2 B1",
+                        )
+                    ),
+                    flush=True,
+                )
+    finally:
         layer.experts._replica_expert_runtime.destroy()
         reset_hybrid_ep_buffer()
         dist.destroy_process_group(single_rank_group)

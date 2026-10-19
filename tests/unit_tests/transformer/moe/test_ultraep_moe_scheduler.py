@@ -3,6 +3,7 @@
 """UltraEP adaptation contracts; no native UltraEP import for the host tests."""
 
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -42,7 +43,7 @@ def test_ultraep_rejects_incompatible_manager_api(monkeypatch, method_name, inva
     else:
         setattr(Manager, method_name, lambda self, layer_id: None)
     monkeypatch.setitem(sys.modules, "ultra_ep", SimpleNamespace(Manager=Manager))
-    with pytest.raises(ImportError, match="UltraEP PR #2"):
+    with pytest.raises(ImportError, match="UltraEP explicit placement"):
         ultraep_backend.create_ultraep_manager(num_layers=1)
 
 
@@ -64,7 +65,6 @@ def test_ultraep_requires_native_multi_manager_lifetime_patch(monkeypatch, suppo
     Manager.supports_multi_manager = supports_multi_manager
     monkeypatch.setitem(sys.modules, "ultra_ep", SimpleNamespace(Manager=Manager))
     monkeypatch.setattr(ultraep_backend, "_managers", [])
-    monkeypatch.setattr(ultraep_backend, "register_replica_transport_finalizer", lambda *args: None)
     if supports_multi_manager:
         manager = ultraep_backend.create_ultraep_manager(num_layers=1)
         assert created == [{"explicitly_destroy": True, "num_layers": 1}]
@@ -73,6 +73,79 @@ def test_ultraep_requires_native_multi_manager_lifetime_patch(monkeypatch, suppo
         with pytest.raises(ImportError, match="ultraep-manager-lifetime.patch"):
             ultraep_backend.create_ultraep_manager(num_layers=1)
         assert created == []
+
+
+def test_ultraep_managers_have_separate_collective_finalizer(monkeypatch):
+    from megatron.core.transformer.moe import replica_weight_transport
+
+    calls = []
+
+    class Manager:
+        supports_multi_manager = True
+
+        def __init__(self, **kwargs):
+            self.device = kwargs["device"]
+
+        def weight_sync(
+            self, *, physical_to_logical_map, logical_to_physical_map, logical_replica_counts
+        ):
+            pass
+
+        grad_reduce = weight_sync
+
+        def destroy(self):
+            calls.append(("destroy", self.device))
+
+    def device_context(device):
+        calls.append(("device", device))
+        return nullcontext()
+
+    monkeypatch.setitem(sys.modules, "ultra_ep", SimpleNamespace(Manager=Manager))
+    monkeypatch.setattr(ultraep_backend, "_managers", [])
+    monkeypatch.setattr(replica_weight_transport, "_transport_finalizers", {})
+    monkeypatch.setattr(torch.cuda, "device", device_context)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append(("sync",)))
+    for device in (0, 1):
+        ultraep_backend.create_ultraep_manager(device=device)
+
+    replica_weight_transport.finalize_replica_weight_transports()
+    assert calls == []
+    ultraep_backend.finalize_ultraep_managers()
+    assert calls == [
+        ("device", 0),
+        ("sync",),
+        ("destroy", 0),
+        ("device", 1),
+        ("sync",),
+        ("destroy", 1),
+    ]
+    assert ultraep_backend._managers == []
+    ultraep_backend.finalize_ultraep_managers()
+    assert len(calls) == 6
+
+
+def test_replica_runtime_finalizes_ultraep_after_consumers(monkeypatch):
+    from megatron.core.transformer.moe import moonep_moe_scheduler, replica_expert_runtime
+
+    calls = []
+    monkeypatch.setattr(
+        replica_expert_runtime,
+        "_replica_expert_runtimes",
+        [SimpleNamespace(destroy=lambda: calls.append("runtime"))],
+    )
+    monkeypatch.setattr(
+        replica_expert_runtime,
+        "finalize_replica_weight_transports",
+        lambda: calls.append("transport"),
+    )
+    monkeypatch.setattr(
+        moonep_moe_scheduler, "finalize_moonep_planner_workspaces", lambda: calls.append("moon_ep")
+    )
+    monkeypatch.setattr(
+        ultraep_backend, "finalize_ultraep_managers", lambda: calls.append("ultra_ep")
+    )
+    replica_expert_runtime.finalize_replica_expert_runtimes()
+    assert calls == ["runtime", "transport", "moon_ep", "ultra_ep"]
 
 
 def test_physical_source_maps_have_master_first_and_inverse_consistency():
@@ -175,6 +248,8 @@ def test_ultraep_configuration_rejects_unsupported_combinations():
         moe_scheduler_expert_dispatcher_type="replica_ultraep",
     )
     assert config.moe_scheduler_planner_type == "ultra_ep"
+    with pytest.raises(ValueError, match="BF16 weights"):
+        _scheduler_config(moe_scheduler_expert_dispatcher_type="replica_ultraep", fp8="e4m3")
     with pytest.raises(ValueError, match="FP32 gradients"):
         _scheduler_config(
             moe_scheduler_expert_dispatcher_type="replica_ultraep", grad_reduce_in_bf16=True
@@ -195,3 +270,28 @@ def test_ultraep_configuration_rejects_unsupported_combinations():
             cuda_graph_impl="transformer_engine",
             cuda_graph_modules=["moe"],
         )
+
+
+@pytest.mark.parametrize(
+    "planner,transport",
+    [
+        ("ultra_ep", "replica_ultraep"),
+        ("ultra_ep", "replica_nccl"),
+        ("echo", "replica_ultraep"),
+        ("echo", "replica_nccl"),
+    ],
+)
+def test_rank_capacity_default_and_explicit_budget(planner, transport):
+    kwargs = dict(
+        moe_scheduler_planner_type=planner, moe_scheduler_expert_dispatcher_type=transport
+    )
+    dynamic = planner == "ultra_ep" or transport == "replica_ultraep"
+    assert _scheduler_config(**kwargs).moe_expert_rank_capacity_factor == (None if dynamic else 1.0)
+    assert (
+        _scheduler_config(
+            **kwargs, moe_expert_rank_capacity_factor=2.0
+        ).moe_expert_rank_capacity_factor
+        == 2.0
+    )
+    with pytest.raises(ValueError, match="moe_expert_rank_capacity_factor"):
+        _scheduler_config(**kwargs, moe_expert_rank_capacity_factor=0.5)

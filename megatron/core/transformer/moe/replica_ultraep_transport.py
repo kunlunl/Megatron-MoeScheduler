@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""UltraEP PR #2 replica communication with physical home-slot identities."""
+"""UltraEP explicit-placement communication with physical home-slot identities."""
 
 from __future__ import annotations
 
@@ -32,6 +32,9 @@ def _compile_placement(
     UltraEP's logical IDs here are *source-home slot IDs*. Model logical identity
     remains private to the planner, including after a home permutation. This
     backend does not itself implement the optimizer-state exchange operation.
+    The common replica IR omits native homes; UltraEP additionally requires a
+    master-first inverse map and counts including those homes. Build these
+    backend-specific maps here so other transports can retain the common IR.
     """
     ep_size = len(table)
     if home_experts <= 0 or not ep_size or nvl_domain_size <= 0 or ep_size % nvl_domain_size:
@@ -73,7 +76,7 @@ class UltraEPTransport(ReplicaWeightTransport):
 
     Each layer owns a manager and stable replica buffers. Planning validates the
     global physical table on the host, so MoE CUDA capture is deliberately rejected.
-    NCCL stream fences surround UltraEP operations: PR #2's local completion
+    NCCL stream fences surround UltraEP operations: native local completion
     events alone do not establish remote producer readiness or destination
     completion. These conservative fences cost overlap and require all EP ranks
     to call every operation in the same order, even with no active replicas.

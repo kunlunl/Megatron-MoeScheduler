@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Run with torchrun on one NVLink domain and the pinned UltraEP PR #2 build."""
+"""Run with torchrun on one NVLink domain and the documented UltraEP build."""
 
 from dataclasses import replace
 
